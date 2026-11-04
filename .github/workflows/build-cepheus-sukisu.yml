@@ -125,6 +125,17 @@ jobs:
             grep -A4 '^config KALLSYMS_BASE_RELATIVE$' init/Kconfig
           fi
 
+          # ---- 把 SUSFS 的 Kconfig 定义搬进树里 ----
+          # 这棵树的 fs/Makefile 有 `obj-$(CONFIG_KSU_SUSFS) += susfs.o`,
+          # 但 CONFIG_KSU_SUSFS 的 Kconfig 定义原本在 KernelSU-Next 的 Kconfig 里。
+          # 换成 SukiSU 后符号没有定义 -> Kconfig 直接把它丢掉 ->
+          # susfs.o 不编译, 所有 CONFIG_KSU_SUSFS_* 变成未定义, SUSFS 全废。
+          if ! grep -q '^config KSU_SUSFS$' fs/Kconfig; then
+            cat ../this-repo/cepheus/prebuilt/susfs-kconfig.txt >> fs/Kconfig
+          fi
+          echo "=== SUSFS Kconfig ==="
+          grep -n '^config KSU_SUSFS' fs/Kconfig | head -12
+
           # ---- 关掉树里的 legacy 手动钩子 ----
           # SukiSU 是 syscall hook 模式 (动态改写 sys_call_table), 不认这些 manual hook。
           # 树里所有手动钩子都用 `#if defined(CONFIG_KSU) && !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)`
