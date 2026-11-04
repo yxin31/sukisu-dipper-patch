@@ -190,6 +190,21 @@ jobs:
             grep -n '__rticdata' include/linux/init.h || true
           fi
 
+          # vdso 的 .S / .lds 预处理路径拿不到 __has_attribute (走的是
+          # -traditional-cpp 一类的简化预处理), 直接用 #if __has_attribute(...)
+          # 会报 "missing binary operator before token ("。
+          # 这棵树里只有 compiler_types.h:331 一处, 且 GCC 11 一定支持
+          # __fallthrough__ 属性, 所以直接常量化为真。
+          if [ -f include/linux/compiler_types.h ]; then
+            sed -i 's/^#if __has_attribute(__fallthrough__)$/#if 1/' include/linux/compiler_types.h
+            echo "=== fallthrough guard ==="
+            grep -n -B1 -A3 'define fallthrough' include/linux/compiler_types.h || true
+            if grep -q '^#if __has_attribute(__fallthrough__)$' include/linux/compiler_types.h; then
+              echo "ERROR: failed to neutralise __has_attribute(__fallthrough__) guard"
+              exit 1
+            fi
+          fi
+
       - name: Build kernel
         working-directory: kernel
         run: |
