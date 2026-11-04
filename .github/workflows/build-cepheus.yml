@@ -84,6 +84,12 @@ jobs:
           echo "=== KernelSU HEAD ==="
           git -C KernelSU log --oneline -1
 
+          # 4.14 内核默认 gnu89, 而 KernelSU 用了 C99 的 for (int i = ...) 声明
+          # 只对 drivers/kernelsu 目录放开 gnu99, 不影响内核其余部分
+          echo 'ccflags-y += -std=gnu99' >> KernelSU/kernel/Makefile
+          echo "=== tail of KernelSU/kernel/Makefile ==="
+          tail -3 KernelSU/kernel/Makefile
+
           # 应用 SUSFS 4.14 的 KernelSU 侧补丁 (基于 v1.0.5, 精确 apply)
           # 注意: 当前在 kernel/KernelSU, 到 workspace 根要退两级
           cd KernelSU
