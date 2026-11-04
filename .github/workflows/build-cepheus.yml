@@ -173,6 +173,12 @@ jobs:
           sed -i 's/^CONFIG_CC_STACKPROTECTOR_STRONG=y/# CONFIG_CC_STACKPROTECTOR_STRONG is not set/' $DEFCONFIG
           sed -i 's/^CONFIG_CC_STACKPROTECTOR=y/# CONFIG_CC_STACKPROTECTOR is not set/' $DEFCONFIG
 
+          # GCC 11 的 __builtin_object_size 比 GCC 4.9 激进, 会让老驱动的
+          # copy_from_user 触发 __bad_copy_to 编译期错误 (如 msm ipa)。
+          # 关掉 FORTIFY_SOURCE 绕过, 这是编译老内核的常规做法。
+          sed -i 's/^CONFIG_FORTIFY_SOURCE=y/# CONFIG_FORTIFY_SOURCE is not set/' $DEFCONFIG
+          grep -q 'CONFIG_FORTIFY_SOURCE' $DEFCONFIG || echo '# CONFIG_FORTIFY_SOURCE is not set' >> $DEFCONFIG
+
           # 版本号对齐原厂 (4.14.180-perf-gb24d113), 只为 vermagic 匹配
           sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${{ env.stock_kernel_sublevel }}/" Makefile
           if grep -q '^CONFIG_LOCALVERSION=' $DEFCONFIG; then
