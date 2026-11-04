@@ -1,13 +1,13 @@
 --- a/kernel/selinux/selinux.c
 +++ b/kernel/selinux/selinux.c
-@@ -52,20 +52,38 @@
- void setenforce(bool enforce)
+@@ -60,20 +60,38 @@
+ void ksu_setenforce(bool enforce)
  {
  #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
 +#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0))
  	selinux_state.enforcing = enforce;
 +#else
-+	/* 4.14: selinux_state 还不存在, 用全局 selinux_enforcing (hooks.c) */
++	/* 4.14: selinux_state 还不存在, 用全局 selinux_enforcing (defined in hooks.c) */
 +	{
 +		extern int selinux_enforcing;
 +		selinux_enforcing = enforce;
@@ -16,7 +16,7 @@
  #endif
  }
  
- bool getenforce()
+ bool ksu_getenforce()
  {
  #ifdef CONFIG_SECURITY_SELINUX_DISABLE
 +#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0))
@@ -30,7 +30,7 @@
 +#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0))
  	return selinux_state.enforcing;
 +#else
-+	/* 4.14: selinux_disabled 是 static, 无法引用; 只看 enforcing */
++	/* 4.14: selinux_disabled is static in hooks.c, cannot be referenced */
 +	{
 +		extern int selinux_enforcing;
 +		return selinux_enforcing;
