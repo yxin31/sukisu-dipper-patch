@@ -1,0 +1,75 @@
+--- a/kernel/selinux/sepolicy.c
++++ b/kernel/selinux/sepolicy.c
+@@ -500,6 +500,13 @@
+ 			       const char *t, const char *c, const char *d,
+ 			       const char *o)
+ {
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0))
++	/* 4.14: policydb uses flex_array (type_val_to_struct_array /
++	 * filename_trans_datum without key), incompatible with this code.
++	 * Skip: allow/permissive rules that root actually needs still work. */
++	pr_warn("KernelSU: add_filename_trans not supported on kernel < 4.15\n");
++	return false;
++#else
+ 	struct type_datum *src, *tgt, *def;
+ 	struct class_datum *cls;
+ 
+@@ -561,6 +568,7 @@
+ 
+ 	db->compat_filename_trans_count++;
+ 	return ebitmap_set_bit(&trans->stypes, src->value - 1, 1) == 0;
++#endif
+ }
+ 
+ static bool add_genfscon(struct policydb *db, const char *fs_name,
+@@ -587,6 +595,13 @@
+ 
+ static bool add_type(struct policydb *db, const char *type_name, bool attr)
+ {
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0))
++	/* 4.14: policydb uses flex_array (type_val_to_struct_array /
++	 * filename_trans_datum without key), incompatible with this code.
++	 * Skip: allow/permissive rules that root actually needs still work. */
++	pr_warn("KernelSU: add_type not supported on kernel < 4.15\n");
++	return false;
++#else
+ 	struct type_datum *type = symtab_search(&db->p_types, type_name);
+ 	if (type) {
+ 		pr_warn("Type %s already exists\n", type_name);
+@@ -662,6 +677,7 @@
+ 	}
+ 
+ 	return true;
++#endif
+ }
+ 
+ static bool set_type_state(struct policydb *db, const char *type_name,
+--- a/kernel/selinux/rules.c
++++ b/kernel/selinux/rules.c
+@@ -18,10 +18,16 @@
+ 
+ static struct policydb *get_policydb(void)
+ {
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0))
+ 	struct policydb *db;
+ 	struct selinux_policy *policy = rcu_dereference(selinux_state.policy);
+ 	db = &policy->policydb;
+ 	return db;
++#else
++	/* 4.14: policydb is a global (security/selinux/ss/services.c) */
++	extern struct policydb policydb;
++	return &policydb;
++#endif
+ }
+ 
+ void ksu_apply_kernelsu_rules()
+@@ -177,7 +183,8 @@
+ // reset avc cache table, otherwise the new rules will not take effect if already denied
+ static void reset_avc_cache()
+ {
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)) || \
++	(LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0))
+ 	avc_ss_reset(0);
+ 	selnl_notify_policyload(0);
+ 	selinux_status_update_policyload(0);
