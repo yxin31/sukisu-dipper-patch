@@ -1,0 +1,4 @@
+# cepheus 构建文件必须保持 LF：
+# 补丁文件一旦被转成 CRLF，git apply / patch 会直接失败。
+cepheus/** text eol=lf
+cepheus/prebuilt/*.bin binary
