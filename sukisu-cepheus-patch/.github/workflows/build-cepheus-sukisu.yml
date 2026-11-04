@@ -1,0 +1,383 @@
+name: Build SukiSU-Ultra + SUSFS for cepheus (MIUI kernel tree)
+
+# 与 build-cepheus-miuikernel.yml 的区别:
+#   - root 框架从 KernelSU-Next 换成 SukiSU-Ultra (kernel side 作为 KernelSU/ 目录)
+#   - SukiSU 走 syscall hook (kprobe / sys_call_table 动态改写), 不用树里的 legacy 手动钩子
+#   - 因此给整棵树加 -DCONFIG_KSU_TAMPER_SYSCALL_TABLE,
+#     树里 6 个文件的 `#if defined(CONFIG_KSU) && !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)`
+#     手动钩子块会自动关闭 (fs/exec.c, fs/open.c, fs/stat.c, fs/read_write.c,
+#     kernel/reboot.c, drivers/input/input.c), 内核源码一行不改。
+#   - SUSFS 仍然是树内 v2.3.0 (fs/susfs.c), 它的钩子用的是 CONFIG_KSU_SUSFS_* 另
+
+env:
+  kernel_repository: Xirudly/kernel_xiaomi_cepheus
+  kernel_ref: 16-ksun_susfs
+  sukisu_repository: SukiSU-Ultra/SukiSU-Ultra
+  sukisu_ref: main
+  device: cepheus
+  defconfig: cepheus_stock_defconfig
+  stock_kernel_sublevel: 180
+  stock_localversion: "-perf-gb24d113"
+  # SukiSU kernel/Kbuild: KSU_VERSION = 40000 + LOCAL_COUNT - 2815
+  # Manager v4.3.0-r1 = 41140  =>  LOCAL_COUNT = 3955
+  ksu_local_count: 3955
+  ksu_version_expect: 41140
+  ksu_manager_tag: v4.3.0-r1
+
+on:
+  workflow_dispatch:
+    inputs:
+      sukisu_ref:
+        description: "SukiSU-Ultra branch"
+        required: false
+        default: "main"
+      allow_rebuild:
+        description: "Force rebuild"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: Build MIUI kernel + SukiSU-Ultra
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Set env
+        run: |
+          echo "sukisu_ref=${{ inputs.sukisu_ref || env.sukisu_ref }}" | tee -a $GITHUB_ENV
+
+      - name: Install packages
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            bc bison flex \
+            libssl-dev libelf-dev \
+            python3 cpio zip
+          aarch64-linux-gnu-gcc --version | head -1
+
+      # 不拉子模块: 树里 pin 的是 KernelSU-Next, 我们要换成 SukiSU
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.kernel_repository }}
+          ref: ${{ env.kernel_ref }}
+          path: kernel
+          submodules: false
+          fetch-depth: 1
+
+      - name: Checkout this repo (prebuilt header/dtb + packer)
+        uses: actions/checkout@v4
+        with:
+          path: this-repo
+
+      - name: Swap KernelSU -> SukiSU-Ultra
+        working-directory: kernel
+        run: |
+          set -e
+          echo "=== before ==="
+          ls -ld KernelSU drivers/kernelsu
+          rm -rf KernelSU
+          git clone --depth 1 --branch "${{ env.sukisu_ref }}" \
+            "https://github.com/${{ env.sukisu_repository }}.git" KernelSU
+          # 去掉 .git: Kbuild 会尝试 git describe/rev-list, 无 .git 时走 fallback,
+          # 我们下面直接把版本号钉死, 避免 GitHub API 限流导致版本号乱跳
+          rm -rf KernelSU/.git
+          echo "=== after ==="
+          ls KernelSU/kernel | head -20
+          test -f KernelSU/kernel/Kconfig || { echo "ERROR: SukiSU kernel/Kconfig missing"; exit 1; }
+          test -f drivers/kernelsu/Kconfig || { echo "ERROR: drivers/kernelsu symlink broken"; exit 1; }
+
+          # 版本号钉死 (KSU_VERSION = 40000 + LOCAL_COUNT - 2815)
+          sed -i "s|^LOCAL_COUNT.*:=.*|LOCAL_COUNT     := ${{ env.ksu_local_count }}|" KernelSU/kernel/Kbuild
+          sed -i "s|^VERSION_TAG.*:=.*|VERSION_TAG     := ${{ env.ksu_manager_tag }}|" KernelSU/kernel/Kbuild
+          grep -n '^LOCAL_COUNT\|^VERSION_TAG\|^VERSION_BASE\|^VERSION_OFFSET' KernelSU/kernel/Kbuild
+
+      - name: Inspect source tree
+        working-directory: kernel
+        run: |
+          echo "kernel_commit_id=$(git rev-parse --short HEAD)" | tee -a $GITHUB_ENV
+          echo "=== version ==="
+          head -5 Makefile | grep -E "VERSION|PATCHLEVEL|SUBLEVEL"
+          echo "=== SUSFS present ==="
+          ls -l fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
+          grep -n 'SUSFS_VERSION' include/linux/susfs.h
+          echo "=== legacy manual hooks (will be disabled) ==="
+          grep -rl 'CONFIG_KSU_TAMPER_SYSCALL_TABLE' --include='*.c' fs kernel drivers security 2>/dev/null || true
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          DEFCONFIG=arch/arm64/configs/${{ env.defconfig }}
+          set -e
+
+          # ---- 必须早于 make defconfig 的 Kconfig 改动 ----
+          # 非 PIE 链接下 kallsyms 的 relative 模式会报
+          # "relative symbol value ... out of range in relative mode",
+          # CONFIG_KALLSYMS_BASE_RELATIVE 无 prompt, 只能改 Kconfig default。
+          if [ -f init/Kconfig ]; then
+            sed -i '/^config KALLSYMS_BASE_RELATIVE$/,/^config /{s/^\tdefault .*/\tdefault n/}' init/Kconfig
+            echo "=== KALLSYMS_BASE_RELATIVE ==="
+            grep -A4 '^config KALLSYMS_BASE_RELATIVE$' init/Kconfig
+          fi
+
+          # ---- 把 SUSFS 的 Kconfig 定义搬进树里 ----
+          # 这棵树的 fs/Makefile 有 `obj-$(CONFIG_KSU_SUSFS) += susfs.o`,
+          # 但 CONFIG_KSU_SUSFS 的 Kconfig 定义原本在 KernelSU-Next 的 Kconfig 里。
+          # 换成 SukiSU 后符号没有定义 -> Kconfig 直接把它丢掉 ->
+          # susfs.o 不编译, 所有 CONFIG_KSU_SUSFS_* 变成未定义, SUSFS 全废。
+          if ! grep -q '^config KSU_SUSFS$' fs/Kconfig; then
+            cat ../this-repo/cepheus/prebuilt/susfs-kconfig.txt >> fs/Kconfig
+          fi
+          echo "=== SUSFS Kconfig ==="
+          grep -n '^config KSU_SUSFS' fs/Kconfig | head -12
+
+          # ---- 关掉树里的 legacy 手动钩子 ----
+          # SukiSU 是 syscall hook 模式 (动态改写 sys_call_table), 不认这些 manual hook。
+          # 树里所有手动钩子都用 `#if defined(CONFIG_KSU) && !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)`
+          # 包着, 所以在顶层 Makefile 末尾加一个全局宏即可全部关掉。
+          # 必须加在文件末尾: KBUILD_CFLAGS 在 Makefile 前部被 := 赋值,
+          # 提前 += 会被覆盖掉。
+          grep -q 'KSU_TAMPER_SYSCALL_TABLE' Makefile || \
+            echo 'KBUILD_CFLAGS += -DCONFIG_KSU_TAMPER_SYSCALL_TABLE' >> Makefile
+          tail -2 Makefile
+
+          # ---- defconfig 覆盖 ----
+          grep -q '^CONFIG_KSU=y' $DEFCONFIG || echo 'CONFIG_KSU=y' >> $DEFCONFIG
+          # SukiSU 的 kernel/Kconfig: depends on KPROBES && EXT4_FS
+          # 少了 KPROBES, CONFIG_KSU 会被 Kconfig 静默丢掉, 内核里什么都没有
+          for o in CONFIG_KPROBES CONFIG_KALLSYMS CONFIG_KALLSYMS_ALL CONFIG_EXT4_FS; do
+            sed -i "s/^# $o is not set/$o=y/" $DEFCONFIG
+            grep -q "^$o=y" $DEFCONFIG || echo "$o=y" >> $DEFCONFIG
+          done
+          grep -q '^CONFIG_KSU_SUSFS=y' $DEFCONFIG || echo 'CONFIG_KSU_SUSFS=y' >> $DEFCONFIG
+          # 这棵树的 conf 基本是 "defconfig 透传", SUSFS 子开关不会自动生成,
+          # 必须逐个显式写出, 否则 fs/susfs.c 对应的 #ifdef 全部编译掉, 只剩空壳。
+          for o in \
+            KSU_SUSFS_SUS_PATH \
+            KSU_SUSFS_SUS_MOUNT \
+            KSU_SUSFS_SUS_KSTAT \
+            KSU_SUSFS_TRY_UMOUNT \
+            KSU_SUSFS_SPOOF_UNAME \
+            KSU_SUSFS_ENABLE_LOG \
+            KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+            KSU_SUSFS_OPEN_REDIRECT \
+            KSU_SUSFS_SUS_MAP
+          do
+            grep -q "^CONFIG_$o=y" $DEFCONFIG || echo "CONFIG_$o=y" >> $DEFCONFIG
+          done
+
+          # 4.14 arm64 没有 HAVE_ARCH_PREL32_RELOCATIONS,
+          # ___ksymtab 存 64 位绝对地址 -> PIE 下新版 binutils 报
+          # "dangerous relocation: unsupported relocation"。
+          # 因此放弃 KASLR (RELOCATABLE/RANDOMIZE_BASE 一起关)。
+          for opt in CONFIG_RELOCATABLE CONFIG_RANDOMIZE_BASE; do
+            sed -i "s/^$opt=y/# $opt is not set/" $DEFCONFIG
+            grep -q "^# $opt is not set" $DEFCONFIG || echo "# $opt is not set" >> $DEFCONFIG
+          done
+
+          # ---- vendor DLKM 兼容性: 关 MODVERSIONS, 但保留 vermagic 里的 modversions 标记 ----
+          # 实机 dmesg: 27 次 "disagrees about version of symbol module_layout",
+          # 14 个 vendor 模块加载失败 (wlan / wcd_core / swr / q6_pdr / tas2557 /
+          # tfa98xx / cs35l41 / wcd_spi / pinctrl_wcd / stub / exfat / rmnet_perf /
+          # hdmi / wglink), 表现是 WiFi 没有 wlan0、音频 codec 不工作。
+          # vendor .ko 用原厂 4.14.180 的 CRC 编译, 这棵树是 4.14.357, CRC 必然不同。
+          # 关掉 CONFIG_MODVERSIONS 后 find_symbol 拿不到 __crc_*, check_version() 直接放行;
+          # 但 vermagic 里必须仍有 "modversions", 否则会变成
+          # "version magic '... modversions aarch64' should be '... aarch64'" 一样加载失败。
+          sed -i 's/^CONFIG_MODVERSIONS=y/# CONFIG_MODVERSIONS is not set/' $DEFCONFIG
+          grep -q 'CONFIG_MODVERSIONS' $DEFCONFIG || echo '# CONFIG_MODVERSIONS is not set' >> $DEFCONFIG
+          sed -i 's/^#ifdef CONFIG_MODVERSIONS$/#if 1 \/* forced: vendor DLKM vermagic needs "modversions" tag *\//' include/linux/vermagic.h
+          echo "=== modversions state ==="
+          grep 'CONFIG_MODVERSIONS' $DEFCONFIG
+          grep -n -B1 -A1 'MODULE_VERMAGIC_MODVERSIONS' include/linux/vermagic.h | head -8
+
+          # GCC 11 的 __builtin_object_size 太激进, 老驱动 copy_from_user 会
+          # 编译期误报 __bad_copy_to (msm ipa)。
+          sed -i 's/^CONFIG_FORTIFY_SOURCE=y/# CONFIG_FORTIFY_SOURCE is not set/' $DEFCONFIG
+          grep -q 'CONFIG_FORTIFY_SOURCE' $DEFCONFIG || echo '# CONFIG_FORTIFY_SOURCE is not set' >> $DEFCONFIG
+
+          # 不用 clang 的 LTO
+          sed -i 's/^CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' $DEFCONFIG
+
+          # 这三个是这棵树新加的符号 (kernel/cpu.c 用), 出厂 defconfig 里没有。
+          # 不给值的话 conf 会当成 NEW 符号弹交互, CI 下直接 abort。
+          for kv in LITTLE_CPU_MASK=15 BIG_CPU_MASK=112 PRIME_CPU_MASK=128; do
+            k=${kv%%=*}
+            grep -q "^CONFIG_$k=" $DEFCONFIG || echo "CONFIG_$kv" >> $DEFCONFIG
+          done
+
+          # ---- 版本号伪装成原厂 (vermagic 必须完全一致) ----
+          sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${{ env.stock_kernel_sublevel }}/" Makefile
+          if grep -q '^CONFIG_LOCALVERSION=' $DEFCONFIG; then
+            sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"${{ env.stock_localversion }}\"|" $DEFCONFIG
+          else
+            echo "CONFIG_LOCALVERSION=\"${{ env.stock_localversion }}\"" >> $DEFCONFIG
+          fi
+          sed -i 's/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' $DEFCONFIG
+
+          echo "=== version alignment ==="
+          head -5 Makefile | grep -E "VERSION|PATCHLEVEL|SUBLEVEL"
+          grep '^CONFIG_LOCALVERSION' $DEFCONFIG
+          echo "=== root/hide config ==="
+          grep -E '^CONFIG_(KSU|KPROBES|KALLSYMS)' $DEFCONFIG || true
+
+      - name: Patch Makefiles for GCC 11 on 4.14
+        working-directory: kernel
+        run: |
+          # -Werror 在老代码 + 新编译器下几乎必然踩坑
+          for f in Makefile scripts/Makefile.build; do
+            [ -f "$f" ] || continue
+            sed -i 's/-Werror=/-Wno-error=/g' "$f"
+            sed -i 's/-Werror\([^a-zA-Z=-]\)/-Wno-error\1/g' "$f"
+            sed -i 's/-Werror$/-Wno-error/g' "$f"
+          done
+
+          # 关闭编译期 object-size 检查 (运行时 __check_object_size 仍保留)
+          if [ -f include/linux/compiler-gcc.h ]; then
+            sed -i 's/__compiletime_object_size(obj) __builtin_object_size(obj, 0)/__compiletime_object_size(obj) (-1)/' \
+              include/linux/compiler-gcc.h
+            grep -n 'compiletime_object_size' include/linux/compiler-gcc.h || true
+          fi
+
+          # 去掉 setlocalversion 在 dirty tree 下追加的 "+",
+          # 否则 vermagic 变成 4.14.180-perf-gb24d113+, vendor .ko 全部加载失败
+          if [ -f scripts/setlocalversion ]; then
+            sed -i 's|res="\$res${scm:++}"|res="$res"|' scripts/setlocalversion
+            grep -n 'res="\$res"' scripts/setlocalversion || true
+          fi
+
+          # 树里的 SUSFS v2.3.0 把 susfs_run_sus_path_loop() 写成 static,
+          # 而 kernel side 会从 setuid hook 外部调用它 -> vmlinux 链接期 undefined reference。
+          if [ -f fs/susfs.c ]; then
+            sed -i 's/^static void susfs_run_sus_path_loop(void)/void susfs_run_sus_path_loop(void)/' fs/susfs.c
+            echo "=== susfs_run_sus_path_loop linkage ==="
+            grep -n 'susfs_run_sus_path_loop' fs/susfs.c | head -3
+            if ! grep -q '^void susfs_run_sus_path_loop(void)' fs/susfs.c; then
+              echo "ERROR: failed to un-static susfs_run_sus_path_loop"
+              exit 1
+            fi
+            grep -q 'void susfs_run_sus_path_loop(void);' include/linux/susfs.h || \
+              sed -i '/susfs_add_sus_path_loop/a void susfs_run_sus_path_loop(void);' include/linux/susfs.h
+            grep -n 'susfs_run_sus_path_loop' include/linux/susfs.h || true
+          fi
+
+          # 小米自定义 .bss.rtic 段在 GCC 11 下会让 ADRP 溢出
+          if [ -f include/linux/init.h ] && grep -q '__rticdata' include/linux/init.h; then
+            sed -i 's|^#define __rticdata.*|#define __rticdata|' include/linux/init.h
+            grep -n '__rticdata' include/linux/init.h || true
+          fi
+
+          # vdso 的 .S / .lds 预处理路径拿不到 __has_attribute,
+          # 直接用 #if __has_attribute(...) 会报 "missing binary operator before token ("。
+          if [ -f include/linux/compiler_types.h ]; then
+            sed -i 's/^#if __has_attribute(__fallthrough__)$/#if 1/' include/linux/compiler_types.h
+            grep -n -B1 -A3 'define fallthrough' include/linux/compiler_types.h || true
+            if grep -q '^#if __has_attribute(__fallthrough__)$' include/linux/compiler_types.h; then
+              echo "ERROR: failed to neutralise __has_attribute(__fallthrough__) guard"
+              exit 1
+            fi
+          fi
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          set -x
+          MK="make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            HOSTCC=gcc HOSTCFLAGS=-fcommon \
+            KCFLAGS=-fcommon"
+
+          $MK ${{ env.defconfig }}
+          $MK olddefconfig
+
+          echo "=== SukiSU / SUSFS config ==="
+          grep -E '^CONFIG_(KSU|KPROBES|KALLSYMS|MODVERSIONS)' out/.config || true
+          for o in CONFIG_KSU CONFIG_KPROBES CONFIG_KALLSYMS CONFIG_KALLSYMS_ALL \
+                   CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT \
+                   CONFIG_KSU_SUSFS_SUS_KSTAT CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+                   CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG; do
+            grep -q "^$o=y" out/.config || { echo "ERROR: $o 没有生效"; exit 1; }
+          done
+          if grep -q '^CONFIG_MODVERSIONS=y' out/.config; then
+            echo "ERROR: MODVERSIONS 还是 y, vendor DLKM 会加载失败 (WiFi/音频全挂)"; exit 1
+          fi
+          for o in CONFIG_THREAD_INFO_IN_TASK CONFIG_UTS_NS CONFIG_PSI; do
+            grep -q "^$o=y" out/.config || { echo "ERROR: $o != y, 出厂配置是 y"; exit 1; }
+          done
+          if grep -q '^CONFIG_RELOCATABLE=y' out/.config; then echo "ERROR: RELOCATABLE=y 但代码非 PIE"; exit 1; fi
+
+          set +e
+          $MK -j$(nproc --all) Image 2>&1 | tee build.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ $RC -ne 0 ] || [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "ERROR: build failed (rc=$RC)"
+            grep -nE "error:|Error [0-9]" build.log | tail -60 || true
+            exit 1
+          fi
+          ls -la out/arch/arm64/boot/Image
+          CAT=$(cat out/include/config/kernel.release)
+          echo "kernel.release = $CAT"
+          if [ "$CAT" != "4.14.${{ env.stock_kernel_sublevel }}${{ env.stock_localversion }}" ]; then
+            echo "ERROR: kernel release '$CAT' != expected, vermagic 会不匹配"
+            exit 1
+          fi
+          echo "vermagic compatible: $CAT"
+          echo "=== SukiSU version line ==="
+          grep -m1 'SukiSU-Ultra version:' build.log || true
+
+      - name: Pack boot.img
+        run: |
+          python3 this-repo/cepheus/scripts/build_bootimg.py \
+            --header this-repo/cepheus/prebuilt/cepheus-boot-header.bin \
+            --image kernel/out/arch/arm64/boot/Image \
+            --dtb this-repo/cepheus/prebuilt/cepheus-stock-dtb.bin \
+            --out boot.img
+          ls -la boot.img
+          md5sum boot.img | tee boot.img.md5
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SukiSU-Ultra-SUSFS-cepheus-miuikernel
+          path: |
+            boot.img
+            boot.img.md5
+            kernel/out/.config
+            kernel/build.log
+          retention-days: 30
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sukisu-cepheus-${{ env.kernel_commit_id }}-r${{ github.run_number }}
+          body: |
+            ## SukiSU-Ultra + SUSFS for Xiaomi Mi 9 (cepheus) — MIUI kernel tree
+
+            **Base tree:** `${{ env.kernel_repository }}@${{ env.kernel_ref }}` (${{ env.kernel_commit_id }})
+            **Root:** SukiSU-Ultra `${{ env.sukisu_ref }}` (kernel version ${{ env.ksu_version_expect }})
+            **Manager APK:** SukiSU `${{ env.ksu_manager_tag }}`
+            **Hide:** SUSFS v2.3.0 (in-tree)
+            **Reported kernel:** 4.14.${{ env.stock_kernel_sublevel }}${{ env.stock_localversion }} (vermagic 与原厂一致)
+            **Hook mode:** syscall hook (`CONFIG_KSU_TAMPER_SYSCALL_TABLE`, 树内 manual hook 已关闭)
+
+            ### Flash
+            ```
+            fastboot flash boot boot.img
+            fastboot reboot
+            ```
+
+            ### Restore
+            ```
+            fastboot flash boot <stock boot.img>
+            ```
+          files: |
+            boot.img
+            boot.img.md5
