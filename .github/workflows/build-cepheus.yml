@@ -275,21 +275,16 @@ jobs:
           # 且无 prompt, defconfig 关不掉, 只能改 Kconfig 的 default。
           # 注意: 必须在本步骤(早于 Build kernel 里的 make defconfig)完成,
           # 否则 .config 已经按旧 default 生成, 改了也不生效。
+          # 这里用 sed 而不是 python heredoc —— heredoc 的内容顶格写会破坏
+          # YAML 的 run: | 缩进块(整份 workflow 直接解析失败, run 里没有 job)。
           if [ -f init/Kconfig ]; then
-            python3 - <<'PY'
-import re
-p = 'init/Kconfig'
-s = open(p).read()
-new, n = re.subn(
-    r'(?m)^config KALLSYMS_BASE_RELATIVE\n(?:\t[^\n]*\n)*?\tdefault [^\n]*\n',
-    'config KALLSYMS_BASE_RELATIVE\n\tbool\n\tdepends on KALLSYMS\n\tdefault n\n',
-    s, count=1)
-assert n == 1, 'KALLSYMS_BASE_RELATIVE stanza not found, cannot disable base-relative'
-open(p, 'w').write(new)
-print('KALLSYMS_BASE_RELATIVE default -> n')
-PY
+            sed -i '/^config KALLSYMS_BASE_RELATIVE$/,/^config /{s/^\tdefault .*/\tdefault n/}' init/Kconfig
             echo "=== KALLSYMS_BASE_RELATIVE ==="
             grep -A4 '^config KALLSYMS_BASE_RELATIVE$' init/Kconfig
+            if sed -n '/^config KALLSYMS_BASE_RELATIVE$/,/^config /p' init/Kconfig | grep -q 'default !IA64'; then
+              echo "ERROR: failed to rewrite KALLSYMS_BASE_RELATIVE default"
+              exit 1
+            fi
           fi
 
       - name: Build kernel
