@@ -1,14 +1,14 @@
-# SukiSU-Ultra Kernel for Xiaomi Mi 8 (dipper)
+# SukiSU-Ultra Kernel for Xiaomi Mi 9 (dipper)
 
-为小米 8 编译集成 SukiSU-Ultra 的 Linux 内核。
+为小米 9 编译集成 SukiSU-Ultra 的 Linux 内核。
 
 ## 信息
 
 | 项目 | 详情 |
 |------|------|
-| 设备 | 小米 8 (dipper) |
+| 设备 | 小米 9 (dipper) |
 | Android 版本 | 9 (Pie) |
-| 内核版本 | 4.9.112 |
+| 内核版本 | 4.14.180 |
 | 内核源码 | [MiCode/Xiaomi_Kernel_OpenSource](https://github.com/MiCode/Xiaomi_Kernel_OpenSource) (分支: `dipper-p-oss`) |
 | Root 方案 | [SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra) |
 | 编译器 | AOSP Clang r365631c (Clang 9, 最兼容 4.9 内核) |
@@ -25,7 +25,7 @@
 
 1. 进入你 Fork 后的仓库页面
 2. 点击 **Actions** 标签页
-3. 选择左侧的 **Build SukiSU-Ultra Kernel for Xiaomi Mi 8 (dipper)**
+3. 选择左侧的 **Build SukiSU-Ultra Kernel for Xiaomi Mi 9 (dipper)**
 4. 点击右侧 **Run workflow** 按钮
 5. 保持默认参数（或自定义 SukiSU 版本），点击绿色 **Run workflow** 按钮
 
