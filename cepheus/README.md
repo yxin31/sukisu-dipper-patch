@@ -257,3 +257,63 @@ cepheus/
 - [susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu) by simonpunk / ShirkNeko
 - [Xiaomi Kernel Open Source](https://github.com/MiCode/Xiaomi_Kernel_OpenSource) by Xiaomi
 - 原始小米 8 版本 [xiziya/sukisu-dipper-patch](https://github.com/xiziya/sukisu-dipper-patch)
+
+---
+
+# 重要更正（MIUI 内核树路线）
+
+上文的 `build-cepheus.yml` 基于 `MiCode/Xiaomi_Kernel_OpenSource` 的 `cepheus-q-oss`
+（4.14.117，Android 10 基线）。**这条路线编出来的内核刷进 MIUI 12.5 必然卡 Mi logo，
+改任何 config 都救不回来**，原因是有硬性的源码缺失：
+
+1. **缺高通 ICE 的 block 层 backport。** 用从原厂 `boot.img` 里解出的**出货真实配置**
+   去编译，立刻在 `fs/crypto/fscrypt_ice.c` 报
+   `'struct bvec_iter' has no member named 'bi_dun'`。
+2. **缺全部 MIUI 专有驱动。** 出厂配置里有 22 个 MIUI 专有 CONFIG
+   （`MIHW` / `MIGT` / `MILLET` / `MI_MEMORY_SYSFS` / `XIAOMI_SOLUTION` /
+   `QTI_CRYPTO_TZ` / `QCOM_SOC_INFO` …），OSS 树里根本没有对应源码。
+3. 顺带一提，`cepheus_user_defconfig` 是 AOSP 向的精简配置，与出厂差了 129 处实质开关
+   （`UTS_NS=n`、`PSI=n`、无 `ANDROID_BINDERFS`、缺 `STATIC_USERMODEHELPER_PATH=/system/bin/micd`），
+   Image 体积也差 10MB（33MB vs 工厂 42MB）。
+
+## 现在用的路线
+
+`.github/workflows/build-cepheus-miuikernel.yml`，内核源改为
+**`Xirudly/kernel_xiaomi_cepheus` @ `16-ksun_susfs`**：
+
+- 小米 MIUI 内核树（4.14.357），自带 `cepheus_stock_defconfig`（出厂配置）
+- 已集成 **SUSFS v2.3.0**（`fs/susfs.c`，带 `LINUX_VERSION_CODE < 5.0` 分支）
+- **KernelSU-Next** 子模块（`sidex15/KernelSU-Next` @ `legacy-susfs-v2`）
+- `drivers/Makefile` / `fs/Makefile` / `drivers/kernelsu` 软链都已接好，无需手工打 SUSFS 补丁
+
+产物结构（与原厂逐字节对齐的部分）：`ANDROID!` v1 / page 4096 / ramdisk 0 /
+原厂 cmdline 原样保留 / `UNCOMPRESSED_IMG` + Image 40.65MB / `ARMd` / `text_offset 0x80000` /
+`flags 0xa` / 5 个拼接 FDT 共 1,995,189B（原厂 dtb 未改）/ vermagic `4.14.180-perf-gb24d113`。
+
+## 这条路线踩到的 5 个坑
+
+1. **`silentoldconfig` 交互中止。** 这棵树新增了 `LITTLE_CPU_MASK` / `BIG_CPU_MASK` /
+   `PRIME_CPU_MASK` 三个符号，出厂 defconfig 里没有 → CI 下 conf 当 NEW 符号弹交互直接 abort。
+   解法：显式给值（取同仓库 `cepheus_defconfig` 的 `15` / `112` / `128`）+ `make olddefconfig` 兜底。
+2. **`#if __has_attribute(__fallthrough__)` 编译失败。** `.S` / `.lds` 走的是简化预处理路径，
+   拿不到 `__has_attribute`，报 `missing binary operator before token "("`。
+   解法：该行改成 `#if 1`（GCC 11 一定支持 `__fallthrough__`）。
+3. **`susfs_run_sus_path_loop` 未定义。** 子模块 pin 的 KernelSU-Next 会外部调用它，
+   但 `fs/susfs.c` 里是 `static`。解法：去掉 `static` 并在 `susfs.h` 补声明。
+4. **SUSFS 子开关要显式写出。** 只写 `CONFIG_KSU_SUSFS=y` 不够，必须逐个写出
+   `KSU_SUSFS_SUS_PATH` / `SUS_MOUNT` / `SUS_KSTAT` / `TRY_UMOUNT` / `SPOOF_UNAME` /
+   `ENABLE_LOG` / `HIDE_KSU_SUSFS_SYMBOLS` / `SPOOF_CMDLINE_OR_BOOTCONFIG` /
+   `OPEN_REDIRECT` / `SUS_MAP`，否则 `fs/susfs.c` 里对应 `#ifdef` 全被编译掉。
+   workflow 里已加硬断言，缺一个就让构建失败。
+5. **仍用 GCC 11 + 关 KASLR。** `android.googlesource.com` 的 `+archive` 端点返回 502，
+   拿不到 clang-r383902 与 `aarch64-linux-android-4.9`。4.14 arm64 没有
+   `HAVE_ARCH_PREL32_RELOCATIONS`，`___ksymtab` 存绝对地址，PIE 下新版 binutils 会报
+   `dangerous relocation`，所以 `CONFIG_RELOCATABLE` / `RANDOMIZE_BASE` 一起关掉
+   （只损失地址随机化，与 root / SUSFS 隐藏无关）。
+
+## 残留风险：`CONFIG_MODVERSIONS`
+
+出厂是 `=y`，我们保持了一致，但源码从 4.14.180 跨到 4.14.357，导出符号的 CRC
+必然对不上，`/vendor/lib/modules` 里的原厂 `.ko`（触屏 / WiFi / 音频）可能在加载时报
+`disagrees about version of symbol`。vermagic 已完全对齐，CRC 是下一层要看的。
+如果刷完能开机但触屏/WiFi 不工作，就把 `CONFIG_MODVERSIONS` 关掉再构建一次。
