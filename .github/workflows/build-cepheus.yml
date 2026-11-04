@@ -10,7 +10,13 @@ env:
   ksu_repository: tiann/KernelSU
   ksu_ref: v1.0.5
   device: cepheus
-  defconfig: cepheus_user_defconfig
+  # 必须用「出厂 config」, 不能用 OSS 里的 cepheus_user_defconfig。
+  # 后者是 AOSP 向精简配置: UTS_NS=n / PID_NS=n / PSI=n / 无 ANDROID_BINDERFS /
+  # 无 STATIC_USERMODEHELPER(micd 模块加载) / 缺一批 MIUI 专有驱动,
+  # 用它编出来的内核刷入后卡 Mi logo。
+  # cepheus_stock_defconfig 是从原厂 boot.img 内嵌 IKCONFIG 原样解出来的。
+  defconfig: cepheus_stock_defconfig
+  defconfig_src: cepheus/defconfig/cepheus_stock_defconfig
   # 伪装成原厂版本号, 让 ramdisk/vendor 里的 .ko vermagic 能对上
   stock_kernel_sublevel: 180
   stock_localversion: "-perf-gb24d113"
@@ -30,6 +36,13 @@ on:
         description: "Force rebuild"
         type: boolean
         default: true
+      mode:
+        description: "patched = 打 SUSFS/KernelSU 补丁; baseline = 不打任何功能补丁(用于隔离故障)"
+        type: choice
+        options:
+          - patched
+          - baseline
+        default: patched
 
 jobs:
   build:
@@ -42,6 +55,7 @@ jobs:
         run: |
           echo "ksu_ref=${{ inputs.ksu_ref || env.ksu_ref }}" | tee -a $GITHUB_ENV
           echo "kernel_ref=${{ inputs.kernel_ref || env.kernel_ref }}" | tee -a $GITHUB_ENV
+          echo "build_mode=${{ inputs.mode || 'patched' }}" | tee -a $GITHUB_ENV
 
       - name: Install packages
         run: |
@@ -76,6 +90,7 @@ jobs:
           echo "kernel_upstream_version=$(make kernelversion 2>/dev/null || echo 4.14.117)" | tee -a $GITHUB_ENV
 
       - name: Clone KernelSU + apply SUSFS patch
+        if: env.build_mode == 'patched'
         working-directory: kernel
         run: |
           # upstream KernelSU v1.0.5 (SUSFS 4.14 补丁的基准)
@@ -136,6 +151,7 @@ jobs:
           grep -c 'config KSU_SUSFS' drivers/kernelsu/Kconfig
 
       - name: Apply kernel patches
+        if: env.build_mode == 'patched'
         working-directory: kernel
         run: |
           # 顺序很重要: 先打 SUSFS 内核侧大补丁, 再打 path_umount / nosuid
@@ -178,12 +194,22 @@ jobs:
         run: |
           DEFCONFIG=arch/arm64/configs/${{ env.defconfig }}
 
-          # 非 GKI + KPROBES root 所需
-          grep -q "CONFIG_KPROBES=y" $DEFCONFIG || echo 'CONFIG_KPROBES=y' >> $DEFCONFIG
-          grep -q "CONFIG_KPROBE_EVENTS=y" $DEFCONFIG || echo 'CONFIG_KPROBE_EVENTS=y' >> $DEFCONFIG
-          grep -q "CONFIG_KSU=y" $DEFCONFIG || echo 'CONFIG_KSU=y' >> $DEFCONFIG
-          # SUSFS 隐藏 root 的核心开关 (其余子选项默认 y)
-          grep -q "CONFIG_KSU_SUSFS=y" $DEFCONFIG || echo 'CONFIG_KSU_SUSFS=y' >> $DEFCONFIG
+          # 把仓库里的出厂 config 复制成可用的 defconfig。
+          # make xxx_defconfig 走的是同一个 conf 解析器, 完整 .config 格式
+          # (含 "# CONFIG_X is not set") 可以直接当 defconfig 用。
+          cp "../this-repo/${{ env.defconfig_src }}" $DEFCONFIG
+          echo "=== defconfig source: ${{ env.defconfig_src }} ==="
+          wc -l $DEFCONFIG
+          grep -E '^CONFIG_(UTS_NS|PSI|ANDROID_BINDERFS|STATIC_USERMODEHELPER_PATH|LOCALVERSION)=' $DEFCONFIG || true
+
+          # 非 GKI + KPROBES root 所需 (仅 patched 模式)
+          if [ "$build_mode" = "patched" ]; then
+            grep -q "CONFIG_KPROBES=y" $DEFCONFIG || echo 'CONFIG_KPROBES=y' >> $DEFCONFIG
+            grep -q "CONFIG_KPROBE_EVENTS=y" $DEFCONFIG || echo 'CONFIG_KPROBE_EVENTS=y' >> $DEFCONFIG
+            grep -q "CONFIG_KSU=y" $DEFCONFIG || echo 'CONFIG_KSU=y' >> $DEFCONFIG
+            # SUSFS 隐藏 root 的核心开关 (其余子选项默认 y)
+            grep -q "CONFIG_KSU_SUSFS=y" $DEFCONFIG || echo 'CONFIG_KSU_SUSFS=y' >> $DEFCONFIG
+          fi
 
           # 关闭 stack protector, 规避 GCC 11 + 4.14 的兼容问题
           sed -i 's/^CONFIG_CC_STACKPROTECTOR_STRONG=y/# CONFIG_CC_STACKPROTECTOR_STRONG is not set/' $DEFCONFIG
@@ -347,6 +373,12 @@ jobs:
 
           echo "=== KSU / KPROBES / SUSFS config ==="
           grep -iE "CONFIG_KSU|CONFIG_KPROBES|CONFIG_LOCALVERSION" out/.config || true
+          echo "=== mode-critical config (must match stock semantics) ==="
+          grep -E '^CONFIG_(UTS_NS|PID_NS|PSI|ANDROID_BINDERFS|STATIC_USERMODEHELPER_PATH|SECURITY_SELINUX|DM_VERITY|SCSI_UFS_QCOM|DRM_MSM)=' out/.config || true
+          if ! grep -q '^CONFIG_UTS_NS=y' out/.config; then
+            echo "ERROR: CONFIG_UTS_NS != y —— 出厂配置是 y, 缺它会卡 logo"
+            exit 1
+          fi
 
           # 硬校验: KASLR 必须已关闭(否则又回到"声称可重定位、实际非 PIE"的死状态),
           # kallsyms 必须是绝对值模式。这三项决定能不能开机。
@@ -404,7 +436,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: KernelSU-SUSFS-cepheus-boot
+          name: KernelSU-SUSFS-cepheus-boot-${{ env.build_mode }}
           path: |
             boot.img
             boot.img.md5
@@ -413,15 +445,16 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ksususfs-${{ env.ksu_ref }}-cepheus-${{ env.kernel_commit_id }}
+          tag_name: ksususfs-${{ env.ksu_ref }}-cepheus-${{ env.kernel_commit_id }}-${{ env.build_mode }}
           body: |
             ## KernelSU + SUSFS for Xiaomi Mi 9 (cepheus)
 
+            **Mode:** `${{ env.build_mode }}`
             **Device:** Xiaomi Mi 9 (cepheus) / MIUI 12.5 (Android 11)
             **Kernel source:** cepheus-q-oss (upstream ${{ env.kernel_upstream_version }}, ${{ env.kernel_commit_id }})
+            **Kernel config:** `cepheus_stock_defconfig` — 由原厂 boot.img 内嵌 IKCONFIG 原样解出
             **Reported version:** 4.14.${{ env.stock_kernel_sublevel }}${{ env.stock_localversion }} (vermagic aligned to stock)
-            **Root:** KernelSU ${{ env.ksu_ref }} (KPROBES, non-GKI)
-            **Hide:** SUSFS 4.14 (v1.5.9)
+            **Root:** KernelSU ${{ env.ksu_ref }} (KPROBES, non-GKI) + SUSFS 4.14 (v1.5.9)
 
             `boot.img` keeps the stock header, stock dtb and stock cmdline, only the kernel Image is replaced.
 
