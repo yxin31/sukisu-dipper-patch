@@ -257,6 +257,18 @@ jobs:
             tail -4 arch/arm64/Makefile
           fi
 
+          # 去掉 scripts/setlocalversion 自动追加的 "+"。
+          # 内核源码是 git 仓库, 打完补丁后 working tree 变 dirty, 4.14 的
+          # setlocalversion 在 LOCALVERSION_AUTO=n 时仍会追加 "+",
+          # kernel.release 变成 4.14.180-perf-gb24d113+,
+          # vermagic 就与原厂 /vendor/lib/modules/*.ko 不匹配 -> vendor 模块全部加载失败。
+          # 关键点: LOCALVERSION_AUTO=n 分支里唯一会加 "+" 的就是这一行。
+          if [ -f scripts/setlocalversion ]; then
+            sed -i 's|res="\$res${scm:++}"|res="$res"|' scripts/setlocalversion
+            echo "=== setlocalversion (plus sign neutralised) ==="
+            grep -n 'scm:++\|res="\$res"\|scm_version --short' scripts/setlocalversion || true
+          fi
+
           # 小米/高通把 SELinux 等变量放进自定义 .bss.rtic 段, 但链接脚本
           # (arch/arm64/kernel/vmlinux.lds.S) 把该段放在 _end / STABS_DEBUG
           # 之后, GCC 11 下 ADRP 的 ±4GB 寻址直接溢出
@@ -326,6 +338,20 @@ jobs:
           }
           echo "=== built kernel release ==="
           cat out/include/config/kernel.release 2>/dev/null || true
+
+          # 硬校验: 版本串必须和原厂 4.14.180-perf-gb24d113 完全一致。
+          # 内核源码是 git 仓库, 打完补丁后 tree 变 dirty, scripts/setlocalversion
+          # 会自动追加一个 "+", 造成 vermagic 变成
+          #   4.14.180-perf-gb24d113+ SMP preempt mod_unload modversions aarch64
+          # 而 /vendor/lib/modules 里的原厂 .ko 期望的是不带 "+" 的版本,
+          # 结果所有 vendor 模块(触屏/显示/wifi)全部加载失败。
+          REL=$(cat out/include/config/kernel.release)
+          if [ "$REL" != "4.14.${stock_kernel_sublevel}${stock_localversion}" ]; then
+            echo "ERROR: kernel release '$REL' != expected '4.14.${stock_kernel_sublevel}${stock_localversion}'"
+            echo "       vermagic 不匹配会导致 vendor 模块无法加载"
+            exit 1
+          fi
+          echo "vermagic compatible: $REL"
 
       - name: Pack boot.img
         run: |
