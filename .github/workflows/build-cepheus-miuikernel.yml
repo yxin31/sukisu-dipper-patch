@@ -184,6 +184,24 @@ jobs:
             grep -n 'res="\$res"' scripts/setlocalversion || true
           fi
 
+          # 子模块 pin 的 KernelSU-Next 比树里的 SUSFS v2.3.0 新:
+          # 它会在 setuid hook 里外部调用 susfs_run_sus_path_loop(),
+          # 但 fs/susfs.c 里这个函数是 static -> vmlinux 链接期 undefined reference。
+          # 新版 SUSFS 里它本来就是全局的, 去掉 static 即可对齐。
+          if [ -f fs/susfs.c ]; then
+            sed -i 's/^static void susfs_run_sus_path_loop(void)/void susfs_run_sus_path_loop(void)/' fs/susfs.c
+            echo "=== susfs_run_sus_path_loop linkage ==="
+            grep -n 'susfs_run_sus_path_loop' fs/susfs.c | head -3
+            if ! grep -q '^void susfs_run_sus_path_loop(void)' fs/susfs.c; then
+              echo "ERROR: failed to un-static susfs_run_sus_path_loop"
+              exit 1
+            fi
+            # 补上声明, 避免隐式声明
+            grep -q 'void susfs_run_sus_path_loop(void);' include/linux/susfs.h || \
+              sed -i '/susfs_add_sus_path_loop/a void susfs_run_sus_path_loop(void);' include/linux/susfs.h
+            grep -n 'susfs_run_sus_path_loop' include/linux/susfs.h || true
+          fi
+
           # 小米自定义 .bss.rtic 段在 GCC 11 下会让 ADRP 溢出
           if [ -f include/linux/init.h ] && grep -q '__rticdata' include/linux/init.h; then
             sed -i 's|^#define __rticdata.*|#define __rticdata|' include/linux/init.h
