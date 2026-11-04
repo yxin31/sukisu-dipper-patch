@@ -103,6 +103,16 @@ jobs:
           if find . -name '*.rej' | grep -q .; then
             echo "ERROR: SUSFS KSU patch left .rej files"; find . -name '*.rej'; exit 1
           fi
+
+          # 4.14 兼容: KernelSU v1.0.5 的 selinux.c 直接用 5.7+ 的 selinux_state
+          if git apply "../../this-repo/cepheus/patches/ksu-4.14-selinux.patch"; then
+            echo "Applied ksu-4.14-selinux.patch with git apply"
+          else
+            echo "git apply failed, trying patch command..."
+            patch -p1 --forward < "../../this-repo/cepheus/patches/ksu-4.14-selinux.patch" || {
+              echo "ERROR: ksu-4.14-selinux.patch failed"; exit 1
+            }
+          fi
           cd ..
 
           # 建立 drivers/kernelsu 软链 + 挂进 Makefile/Kconfig (等价于官方 setup.sh)
