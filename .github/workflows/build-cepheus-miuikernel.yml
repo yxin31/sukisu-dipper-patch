@@ -1,0 +1,265 @@
+name: Build KernelSU-Next + SUSFS for cepheus (MIUI kernel tree)
+
+# 为什么不用 MiCode/Xiaomi_Kernel_OpenSource?
+#   那份 cepheus-q-oss 是 4.14.117 的 Android-10 基线快照, 不是 MIUI 12.5 出货用的树:
+#     - 缺 block 层的 ICE backport (`struct bvec_iter.bi_dun`), 一开
+#       CONFIG_FS_ENCRYPTION_INLINE_CRYPT 就编译失败
+#     - 缺 MIUI 专有驱动 (MIHW / MIGT / MILLET / MI_MEMORY_SYSFS /
+#       XIAOMI_SOLUTION / QTI_CRYPTO_TZ / QCOM_SOC_INFO ...)
+#   用它编出来的内核刷进 MIUI 只会卡 Mi logo, 改 config 救不回来。
+#
+# 这里改用 Xirudly/kernel_xiaomi_cepheus 的 16-ksun_susfs 分支:
+#   - 基于小米 MIUI 内核树 (自带 cepheus_stock_defconfig + MIUI 驱动)
+#   - 已集成 SUSFS v2.3.0 (fs/susfs.c, 带 LINUX_VERSION_CODE < 5.0 分支)
+#   - KernelSU-Next 作为子模块 (sidex15/KernelSU-Next, legacy-susfs-v2)
+
+env:
+  kernel_repository: Xirudly/kernel_xiaomi_cepheus
+  kernel_ref: 16-ksun_susfs
+  device: cepheus
+  # 树里自带的出厂配置 (从 MIUI 出货内核提取, 含 MIUI 专有驱动)
+  defconfig: cepheus_stock_defconfig
+  stock_kernel_sublevel: 180
+  stock_localversion: "-perf-gb24d113"
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "Kernel branch (default: 16-ksun_susfs)"
+        required: false
+        default: "16-ksun_susfs"
+      allow_rebuild:
+        description: "Force rebuild"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: Build MIUI kernel
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Set env
+        run: |
+          echo "kernel_ref=${{ inputs.kernel_ref || env.kernel_ref }}" | tee -a $GITHUB_ENV
+
+      - name: Install packages
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            bc bison flex \
+            libssl-dev libelf-dev \
+            python3 cpio zip
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: Checkout kernel source (with KernelSU submodule)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.kernel_repository }}
+          ref: ${{ env.kernel_ref }}
+          path: kernel
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout this repo (prebuilt header/dtb + packer)
+        uses: actions/checkout@v4
+        with:
+          path: this-repo
+
+      - name: Inspect source tree
+        working-directory: kernel
+        run: |
+          echo "kernel_commit_id=$(git rev-parse --short HEAD)" | tee -a $GITHUB_ENV
+          echo "=== version ==="
+          head -5 Makefile | grep -E "VERSION|PATCHLEVEL|SUBLEVEL"
+          echo "=== KSU submodule ==="
+          ls -l drivers/kernelsu
+          test -f KernelSU/kernel/Kconfig || { echo "ERROR: KernelSU submodule not checked out"; ls -l KernelSU; exit 1; }
+          grep -c 'config KSU' KernelSU/kernel/Kconfig || true
+          echo "=== SUSFS present ==="
+          ls -l fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
+          grep -n 'SUSFS_VERSION' include/linux/susfs.h
+          echo "=== defconfig present ==="
+          ls -l arch/arm64/configs/${{ env.defconfig }}
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          DEFCONFIG=arch/arm64/configs/${{ env.defconfig }}
+          set -e
+
+          # ---- 必须早于 make defconfig 的 Kconfig 改动 ----
+          # 非 PIE 链接下 kallsyms 的 relative 模式会报
+          # "relative symbol value ... out of range in relative mode",
+          # CONFIG_KALLSYMS_BASE_RELATIVE 无 prompt, 只能改 Kconfig default。
+          if [ -f init/Kconfig ]; then
+            sed -i '/^config KALLSYMS_BASE_RELATIVE$/,/^config /{s/^\tdefault .*/\tdefault n/}' init/Kconfig
+            echo "=== KALLSYMS_BASE_RELATIVE ==="
+            grep -A4 '^config KALLSYMS_BASE_RELATIVE$' init/Kconfig
+          fi
+
+          # ---- defconfig 覆盖 ----
+          # Root + 隐藏 root
+          grep -q '^CONFIG_KSU=y' $DEFCONFIG || echo 'CONFIG_KSU=y' >> $DEFCONFIG
+          grep -q '^CONFIG_KSU_SUSFS=y' $DEFCONFIG || echo 'CONFIG_KSU_SUSFS=y' >> $DEFCONFIG
+
+          # 4.14 arm64 没有 HAVE_ARCH_PREL32_RELOCATIONS,
+          # ___ksymtab 存 64 位绝对地址 -> PIE 下新版 binutils 报
+          # "dangerous relocation: unsupported relocation"。
+          # 因此放弃 KASLR (RELOCATABLE/RANDOMIZE_BASE 一起关),
+          # 内核按 Image header 的 text_offset 固定加载。
+          # 代价仅是没有地址随机化, 与 root/SUSFS 隐藏无关。
+          for opt in CONFIG_RELOCATABLE CONFIG_RANDOMIZE_BASE; do
+            sed -i "s/^$opt=y/# $opt is not set/" $DEFCONFIG
+            grep -q "^# $opt is not set" $DEFCONFIG || echo "# $opt is not set" >> $DEFCONFIG
+          done
+
+          # GCC 11 的 __builtin_object_size 太激进, 老驱动 copy_from_user 会
+          # 编译期误报 __bad_copy_to (msm ipa)。
+          sed -i 's/^CONFIG_FORTIFY_SOURCE=y/# CONFIG_FORTIFY_SOURCE is not set/' $DEFCONFIG
+          grep -q 'CONFIG_FORTIFY_SOURCE' $DEFCONFIG || echo '# CONFIG_FORTIFY_SOURCE is not set' >> $DEFCONFIG
+
+          # 不用 clang 的 LTO
+          sed -i 's/^CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' $DEFCONFIG
+
+          # ---- 版本号伪装成原厂 (vermagic 必须完全一致) ----
+          sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${{ env.stock_kernel_sublevel }}/" Makefile
+          if grep -q '^CONFIG_LOCALVERSION=' $DEFCONFIG; then
+            sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"${{ env.stock_localversion }}\"|" $DEFCONFIG
+          else
+            echo "CONFIG_LOCALVERSION=\"${{ env.stock_localversion }}\"" >> $DEFCONFIG
+          fi
+          sed -i 's/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' $DEFCONFIG
+
+          echo "=== version alignment ==="
+          head -5 Makefile | grep -E "VERSION|PATCHLEVEL|SUBLEVEL"
+          grep '^CONFIG_LOCALVERSION' $DEFCONFIG
+          echo "=== root/hide config ==="
+          grep -E '^CONFIG_KSU' $DEFCONFIG || true
+
+      - name: Patch Makefiles for GCC 11 on 4.14
+        working-directory: kernel
+        run: |
+          # -Werror 在老代码 + 新编译器下几乎必然踩坑
+          for f in Makefile scripts/Makefile.build; do
+            [ -f "$f" ] || continue
+            sed -i 's/-Werror=/-Wno-error=/g' "$f"
+            sed -i 's/-Werror\([^a-zA-Z=-]\)/-Wno-error\1/g' "$f"
+            sed -i 's/-Werror$/-Wno-error/g' "$f"
+          done
+
+          # 小米内核自带的 gcc-wrapper.py 是 Python2 语法, Python3 下直接崩溃
+          if [ -f scripts/gcc-wrapper.py ]; then
+            printf '%s\n' '#!/usr/bin/env python3' 'import subprocess, sys' \
+              'sys.exit(subprocess.call(sys.argv[1:]))' > scripts/gcc-wrapper.py
+            chmod +x scripts/gcc-wrapper.py
+            echo "=== gcc-wrapper.py replaced ==="
+          fi
+
+          # 关闭编译期 object-size 检查 (运行时 __check_object_size 仍保留)
+          if [ -f include/linux/compiler-gcc.h ]; then
+            sed -i 's/__compiletime_object_size(obj) __builtin_object_size(obj, 0)/__compiletime_object_size(obj) (-1)/' \
+              include/linux/compiler-gcc.h
+            grep -n 'compiletime_object_size' include/linux/compiler-gcc.h || true
+          fi
+
+          # 去掉 setlocalversion 在 dirty tree 下追加的 "+",
+          # 否则 vermagic 变成 4.14.180-perf-gb24d113+, vendor .ko 全部加载失败
+          if [ -f scripts/setlocalversion ]; then
+            sed -i 's|res="\$res${scm:++}"|res="$res"|' scripts/setlocalversion
+            grep -n 'res="\$res"' scripts/setlocalversion || true
+          fi
+
+          # 小米自定义 .bss.rtic 段在 GCC 11 下会让 ADRP 溢出
+          if [ -f include/linux/init.h ] && grep -q '__rticdata' include/linux/init.h; then
+            sed -i 's|^#define __rticdata.*|#define __rticdata|' include/linux/init.h
+            grep -n '__rticdata' include/linux/init.h || true
+          fi
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          set -x
+          MK="make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            HOSTCC=gcc HOSTCFLAGS=-fcommon \
+            KCFLAGS=-fcommon"
+
+          $MK ${{ env.defconfig }}
+
+          echo "=== boot-critical config ==="
+          grep -E '^CONFIG_(KSU|KSU_SUSFS|RELOCATABLE|RANDOMIZE_BASE|UTS_NS|PSI|STATIC_USERMODEHELPER_PATH|SECURITY_SELINUX|FS_ENCRYPTION_INLINE_CRYPT|SCSI_UFS_QCOM_ICE)=' out/.config || true
+          if grep -q '^CONFIG_KSU=y' out/.config; then echo "KSU enabled"; else echo "ERROR: CONFIG_KSU not enabled"; exit 1; fi
+          if grep -q '^CONFIG_RELOCATABLE=y' out/.config; then echo "ERROR: RELOCATABLE=y 但代码非 PIE"; exit 1; fi
+
+          set +e
+          $MK -j$(nproc --all) Image 2>&1 | tee build.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ $RC -ne 0 ] || [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "ERROR: build failed (rc=$RC)"
+            grep -nE "error:|Error [0-9]" build.log | tail -40 || true
+            exit 1
+          fi
+          ls -la out/arch/arm64/boot/Image
+          CAT=$(cat out/include/config/kernel.release)
+          echo "kernel.release = $CAT"
+          if [ "$CAT" != "4.14.${stock_kernel_sublevel}${stock_localversion}" ]; then
+            echo "ERROR: kernel release '$CAT' != expected, vermagic 会不匹配"
+            exit 1
+          fi
+          echo "vermagic compatible: $CAT"
+
+      - name: Pack boot.img
+        run: |
+          python3 this-repo/cepheus/scripts/build_bootimg.py \
+            --header this-repo/cepheus/prebuilt/cepheus-boot-header.bin \
+            --image kernel/out/arch/arm64/boot/Image \
+            --dtb this-repo/cepheus/prebuilt/cepheus-stock-dtb.bin \
+            --out boot.img
+          ls -la boot.img
+          md5sum boot.img | tee boot.img.md5
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernelSU-Next-SUSFS-cepheus-miuikernel
+          path: |
+            boot.img
+            boot.img.md5
+          retention-days: 30
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ksun-susfs-cepheus-${{ env.kernel_commit_id }}
+          body: |
+            ## KernelSU-Next + SUSFS for Xiaomi Mi 9 (cepheus) — MIUI kernel tree
+
+            **Base tree:** `${{ env.kernel_repository }}@${{ env.kernel_ref }}` (${{ env.kernel_commit_id }})
+            **Why this tree:** 小米 OSS 的 `cepheus-q-oss` 是 4.14.117 的 A10 基线, 缺 ICE block backport 与全部 MIUI 专有驱动, 编出来刷 MIUI 必卡 logo。这棵树是 MIUI 内核树。
+            **Config:** `${{ env.defconfig }}` (出厂配置) + `CONFIG_KSU` / `CONFIG_KSU_SUSFS`
+            **Reported version:** 4.14.${{ env.stock_kernel_sublevel }}${{ env.stock_localversion }} (vermagic 与原厂一致)
+            **Root:** KernelSU-Next (legacy-susfs-v2) · **Hide:** SUSFS v2.3.0
+
+            ### Flash
+            ```
+            fastboot getvar product     # 必须是 cepheus
+            fastboot flash boot boot.img
+            fastboot reboot
+            ```
+
+            ### Restore
+            ```
+            fastboot flash boot <stock boot.img>
+            ```
+          files: |
+            boot.img
+            boot.img.md5
