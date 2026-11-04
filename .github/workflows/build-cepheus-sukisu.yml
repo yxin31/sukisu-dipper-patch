@@ -108,6 +108,13 @@ jobs:
           grep -q '__aarch64__' KernelSU/kernel/hook/syscall_hook.h || {
             echo "ERROR: syscall_fn_t aarch64 compat not applied"; exit 1; }
 
+          # 4.14 缺的两个头: linux/pgtable.h (5.4 才有)、linux/minmax.h (5.10 才有)
+          find KernelSU/kernel -type f \( -name '*.c' -o -name '*.h' \) -exec \
+            sed -i -e 's@<linux/pgtable.h>@<asm/pgtable.h>@g' \
+                   -e 's@<linux/minmax.h>@<linux/kernel.h>@g' {} +
+          echo "=== header compat leftovers (应为空) ==="
+          grep -rn '<linux/pgtable.h>\|<linux/minmax.h>' KernelSU/kernel | head -5 || true
+
       - name: Inspect source tree
         working-directory: kernel
         run: |
@@ -325,12 +332,13 @@ jobs:
           if grep -q '^CONFIG_RELOCATABLE=y' out/.config; then echo "ERROR: RELOCATABLE=y 但代码非 PIE"; exit 1; fi
 
           set +e
-          $MK -j$(nproc --all) Image 2>&1 | tee build.log
+          # -k: 一次把所有编译错误都跑出来, 省得一个错一轮 CI
+          $MK -k -j$(nproc --all) Image 2>&1 | tee build.log
           RC=${PIPESTATUS[0]}
           set -e
           if [ $RC -ne 0 ] || [ ! -f out/arch/arm64/boot/Image ]; then
             echo "ERROR: build failed (rc=$RC)"
-            grep -nE "error:|Error [0-9]" build.log | tail -60 || true
+            grep -hE "error:|fatal error|undefined reference|Error [0-9]" build.log | sort -u | head -60 || true
             exit 1
           fi
           ls -la out/arch/arm64/boot/Image
