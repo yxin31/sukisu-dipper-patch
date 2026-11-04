@@ -195,6 +195,16 @@ jobs:
           sed -i 's/^CONFIG_FORTIFY_SOURCE=y/# CONFIG_FORTIFY_SOURCE is not set/' $DEFCONFIG
           grep -q 'CONFIG_FORTIFY_SOURCE' $DEFCONFIG || echo '# CONFIG_FORTIFY_SOURCE is not set' >> $DEFCONFIG
 
+          # 【关键】关掉 DYNAMIC_DEBUG。
+          # 它会给每个 pr_debug 生成一个 __verbose 段条目, 段里存 absolute 地址;
+          # GCC 11 + 新版汇编器在 PIE 模式下对该段报
+          # "dangerous relocation: unsupported relocation"(msm gsi.o 首当其冲)。
+          # 之前用「关 PIE」来绕过, 结果破坏了 CONFIG_RELOCATABLE -> 不开机。
+          # 关掉 DYNAMIC_DEBUG 后 __verbose 段不再生成, PIE 得以保留。
+          # 代价: 失去 dynamic debug 的运行时开关(对日常使用无影响)。
+          sed -i 's/^CONFIG_DYNAMIC_DEBUG=y/# CONFIG_DYNAMIC_DEBUG is not set/' $DEFCONFIG
+          grep -q 'CONFIG_DYNAMIC_DEBUG' $DEFCONFIG || echo '# CONFIG_DYNAMIC_DEBUG is not set' >> $DEFCONFIG
+
           # 版本号对齐原厂 (4.14.180-perf-gb24d113), 只为 vermagic 匹配
           sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${{ env.stock_kernel_sublevel }}/" Makefile
           if grep -q '^CONFIG_LOCALVERSION=' $DEFCONFIG; then
@@ -246,16 +256,21 @@ jobs:
             grep -n 'compiletime_object_size' include/linux/compiler-gcc.h
           fi
 
-          # 4.14 的 Makefile 还没有 -fno-PIE (4.15 才加), 而 Ubuntu 22.04 的
-          # GCC 默认生成 PIE 代码 -> dynamic debug 的 __verbose 段里绝对地址
-          # 在新版 ld 下报 "dangerous relocation: unsupported relocation"。
-          # 显式关闭 PIE (编译 -fno-PIE + 链接 -no-pie)。
-          if [ -f arch/arm64/Makefile ]; then
-            grep -q 'KBUILD_CFLAGS += -fno-PIE' arch/arm64/Makefile || \
-              printf '\nKBUILD_CFLAGS += -fno-PIE\nLDFLAGS_vmlinux += -no-pie\n' >> arch/arm64/Makefile
-            echo "=== arm64 Makefile tail ==="
-            tail -4 arch/arm64/Makefile
+          # 【绝对不能关 PIE】原厂 config 是 CONFIG_RELOCATABLE=y +
+          # CONFIG_RANDOMIZE_BASE=y, 4.14 的 arch/arm64/Makefile 在这种情况下
+          # 会加 `-fpie` 和 `LDFLAGS_vmlinux += -pie -shared -Bsymbolic`,
+          # 内核靠 __relocate_kernel 在启动早期自定位。把它改成 -fno-PIE/-no-pie
+          # 会生成位置相关的内核, 与原厂启动假设置冲突 -> 黑屏不开机。
+          # 之前之所以想关 PIE, 是因为 dynamic debug 的 __verbose 段在 PIE 下
+          # 报 "dangerous relocation: unsupported relocation"(gsi.o)。
+          # 正确解法是关掉 CONFIG_DYNAMIC_DEBUG(见 Configure kernel 步骤),
+          # 而不是关 PIE。这里保留一个断言, 防止有人又把 PIE 关掉。
+          if grep -q 'fno-PIE' arch/arm64/Makefile 2>/dev/null; then
+            echo "ERROR: arch/arm64/Makefile 里出现了 -fno-PIE, 会破坏 CONFIG_RELOCATABLE/KASLR"
+            exit 1
           fi
+          echo "=== arm64 PIE flags (must be intact) ==="
+          grep -n 'fpie\|LDFLAGS_vmlinux' arch/arm64/Makefile | head -20 || true
 
           # 去掉 scripts/setlocalversion 自动追加的 "+"。
           # 内核源码是 git 仓库, 打完补丁后 working tree 变 dirty, 4.14 的
@@ -280,24 +295,11 @@ jobs:
             grep -n '__rticdata' include/linux/init.h
           fi
 
-          # -no-pie 链接下 kallsyms 的 relative 模式找不到基准符号 _text,
-          # 报 "relative symbol value 0xffffff8008080000 out of range in relative mode"。
-          # CONFIG_KALLSYMS_BASE_RELATIVE 在本内核里是
-          #   default !IA64 && !(TILE && 64BIT)   (不是 default y!)
-          # 且无 prompt, defconfig 关不掉, 只能改 Kconfig 的 default。
-          # 注意: 必须在本步骤(早于 Build kernel 里的 make defconfig)完成,
-          # 否则 .config 已经按旧 default 生成, 改了也不生效。
-          # 这里用 sed 而不是 python heredoc —— heredoc 的内容顶格写会破坏
-          # YAML 的 run: | 缩进块(整份 workflow 直接解析失败, run 里没有 job)。
-          if [ -f init/Kconfig ]; then
-            sed -i '/^config KALLSYMS_BASE_RELATIVE$/,/^config /{s/^\tdefault .*/\tdefault n/}' init/Kconfig
-            echo "=== KALLSYMS_BASE_RELATIVE ==="
-            grep -A4 '^config KALLSYMS_BASE_RELATIVE$' init/Kconfig
-            if sed -n '/^config KALLSYMS_BASE_RELATIVE$/,/^config /p' init/Kconfig | grep -q 'default !IA64'; then
-              echo "ERROR: failed to rewrite KALLSYMS_BASE_RELATIVE default"
-              exit 1
-            fi
-          fi
+          # KALLSYMS 保持原厂配置 (CONFIG_KALLSYMS_BASE_RELATIVE=y)。
+          # 之前把它改成 n 是为了绕开 "-no-pie 下 relative 模式找不到 _text" 的错误,
+          # 现在 PIE 保住了, relative 模式正常工作, 不需要也不应该动它。
+          echo "=== KALLSYMS_BASE_RELATIVE (leave default) ==="
+          grep -A4 '^config KALLSYMS_BASE_RELATIVE$' init/Kconfig || true
 
       - name: Build kernel
         working-directory: kernel
@@ -315,13 +317,14 @@ jobs:
           echo "=== KSU / KPROBES / SUSFS config ==="
           grep -iE "CONFIG_KSU|CONFIG_KPROBES|CONFIG_LOCALVERSION" out/.config || true
 
-          # 硬校验: base-relative 必须已关闭, 否则 vmlinux 链接到最后一步必然失败
-          if grep -q '^CONFIG_KALLSYMS_BASE_RELATIVE=y' out/.config; then
-            echo "ERROR: CONFIG_KALLSYMS_BASE_RELATIVE still enabled, init/Kconfig patch failed"
+          # 硬校验: RELOCATABLE / KASLR 必须是 y, 且 PIE 标志没被破坏。
+          # 这两项决定内核能不能起来, 比 SUSFS 重要得多。
+          echo "=== boot-critical config ==="
+          grep -E '^CONFIG_(RELOCATABLE|RANDOMIZE_BASE|KALLSYMS_BASE_RELATIVE)=' out/.config
+          if ! grep -q '^CONFIG_RELOCATABLE=y' out/.config; then
+            echo "ERROR: CONFIG_RELOCATABLE != y, 内核将无法自定位 (原厂是 y)"
             exit 1
           fi
-          echo "=== kallsyms mode ==="
-          grep -i 'KALLSYMS' out/.config || true
 
           make O=out ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
