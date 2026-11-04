@@ -157,6 +157,22 @@ jobs:
           # 确认 SUSFS 新文件就位
           ls -l fs/susfs.c fs/sus_su.c include/linux/susfs.h include/linux/susfs_def.h include/linux/sus_su.h
 
+          # ---- 4.14 符号兼容 (以下 API 在 4.14 不存在, 链接期会 undefined) ----
+          # 1) 5.0+ 的 inotify_mark_user_mask(): 4.14 直接用 mark->mask
+          sed -i 's/inotify_mark_user_mask(mark)/mark->mask/' fs/notify/fdinfo.c
+          grep -n 'mark->mask' fs/notify/fdinfo.c | tail -2
+
+          # 2) 5.8+ 的 strncpy_from_user_nofault(): 4.14 的 strncpy_from_user 本身
+          #    已带缺页保护, 失败返回 -EFAULT 而不会 oops
+          sed -i 's/strncpy_from_user_nofault(dst, unsafe_addr, count)/strncpy_from_user(dst, unsafe_addr, count)/' \
+            KernelSU/kernel/kernel_compat.c
+          grep -n 'ksu_strncpy_from_user_nofault' -A2 KernelSU/kernel/kernel_compat.c | head -6
+
+          # 3) 5.x 的 selinux_inode(): 4.14 直接取 inode->i_security
+          sed -i 's/selinux_inode(inode)/(struct inode_security_struct *)inode->i_security/' \
+            KernelSU/kernel/sucompat.c
+          grep -n 'inode_security_struct \*sec' KernelSU/kernel/sucompat.c
+
       - name: Configure kernel
         working-directory: kernel
         run: |
