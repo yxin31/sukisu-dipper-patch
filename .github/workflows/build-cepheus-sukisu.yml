@@ -97,6 +97,17 @@ jobs:
           sed -i "s|^VERSION_TAG.*:=.*|VERSION_TAG     := ${{ env.ksu_manager_tag }}|" KernelSU/kernel/Kbuild
           grep -n '^LOCAL_COUNT\|^VERSION_TAG\|^VERSION_BASE\|^VERSION_OFFSET' KernelSU/kernel/Kbuild
 
+          # kernel/hook/syscall_hook.h 里 syscall_fn_t 只给 x86_64 / riscv 定义了,
+          # arm64 依赖内核 <asm/syscall.h> 提供 —— 那是 4.17+ 才有, 4.14 直接报
+          # "unknown type name 'syscall_fn_t'"。
+          # riscv 分支的 typedef 和 arm64 完全一样, 直接把 aarch64 挂过去。
+          sed -i 's@^#elif defined(__riscv)$@#elif defined(__riscv) || defined(__aarch64__)@' \
+            KernelSU/kernel/hook/syscall_hook.h
+          echo "=== syscall_fn_t compat ==="
+          grep -n -A2 '__riscv' KernelSU/kernel/hook/syscall_hook.h | head -6
+          grep -q '__aarch64__' KernelSU/kernel/hook/syscall_hook.h || {
+            echo "ERROR: syscall_fn_t aarch64 compat not applied"; exit 1; }
+
       - name: Inspect source tree
         working-directory: kernel
         run: |
