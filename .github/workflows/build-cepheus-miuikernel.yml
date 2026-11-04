@@ -88,6 +88,32 @@ jobs:
           echo "=== defconfig present ==="
           ls -l arch/arm64/configs/${{ env.defconfig }}
 
+      # KSU_VERSION = 30000 + git rev-list --count HEAD + 150  (kernel/Kbuild:84)
+      # fetch-depth: 1 让子模块只有 1 个 commit => 版本算成 30151,
+      # 而 Manager v3.4.2 需要 33355, 界面报 "Kernel update required", ksud 不安装, su 全废.
+      # Kbuild:73 自带 unshallow, 但判据 [ -f .git/shallow ] 在 submodule 下永远为假
+      # (子模块 .git 是 gitfile 不是目录), 所以必须在这里补.
+      - name: Fix KSU_VERSION (unshallow KernelSU submodule)
+        working-directory: kernel
+        run: |
+          set -e
+          cd KernelSU
+          C_BEFORE=$(git rev-list --count HEAD)
+          echo "commits before: $C_BEFORE"
+          echo "shallow: $(git rev-parse --is-shallow-repository)"
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --unshallow --tags origin || git fetch --unshallow --tags || true
+          fi
+          CNT=$(git rev-list --count HEAD)
+          CNT=${CNT:-1}
+          echo "commits after : $CNT"
+          echo "KSU_VERSION   : $((30000 + CNT + 150))  (target: 33355 = Manager v3.4.2)"
+          if [ "$CNT" -lt 3205 ]; then
+            echo "WARNING: history still short, pinning KSU_GIT_VERSION=3205"
+            sed -i 's|^KSU_GIT_VERSION := .*|KSU_GIT_VERSION := 3205|' kernel/Kbuild
+            grep -n '^KSU_GIT_VERSION' kernel/Kbuild
+          fi
+
       - name: Configure kernel
         working-directory: kernel
         run: |
