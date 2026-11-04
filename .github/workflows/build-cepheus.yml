@@ -246,6 +246,17 @@ jobs:
             grep -n 'compiletime_object_size' include/linux/compiler-gcc.h
           fi
 
+          # 4.14 的 Makefile 还没有 -fno-PIE (4.15 才加), 而 Ubuntu 22.04 的
+          # GCC 默认生成 PIE 代码 -> dynamic debug 的 __verbose 段里绝对地址
+          # 在新版 ld 下报 "dangerous relocation: unsupported relocation"。
+          # 显式关闭 PIE (编译 -fno-PIE + 链接 -no-pie)。
+          if [ -f arch/arm64/Makefile ]; then
+            grep -q 'KBUILD_CFLAGS += -fno-PIE' arch/arm64/Makefile || \
+              printf '\nKBUILD_CFLAGS += -fno-PIE\nLDFLAGS_vmlinux += -no-pie\n' >> arch/arm64/Makefile
+            echo "=== arm64 Makefile tail ==="
+            tail -4 arch/arm64/Makefile
+          fi
+
       - name: Build kernel
         working-directory: kernel
         run: |
