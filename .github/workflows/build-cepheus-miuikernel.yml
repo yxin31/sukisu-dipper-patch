@@ -108,6 +108,23 @@ jobs:
           # Root + 隐藏 root
           grep -q '^CONFIG_KSU=y' $DEFCONFIG || echo 'CONFIG_KSU=y' >> $DEFCONFIG
           grep -q '^CONFIG_KSU_SUSFS=y' $DEFCONFIG || echo 'CONFIG_KSU_SUSFS=y' >> $DEFCONFIG
+          # 注意: 这棵树的 conf 基本是"defconfig 透传", 子开关不会自动按 default 生成,
+          # 必须逐个显式写出, 否则 fs/susfs.c 里对应的 #ifdef 全部编译掉,
+          # 内核里就只有一个空壳 SUSFS。
+          for o in \
+            KSU_SUSFS_SUS_PATH \
+            KSU_SUSFS_SUS_MOUNT \
+            KSU_SUSFS_SUS_KSTAT \
+            KSU_SUSFS_TRY_UMOUNT \
+            KSU_SUSFS_SPOOF_UNAME \
+            KSU_SUSFS_ENABLE_LOG \
+            KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+            KSU_SUSFS_OPEN_REDIRECT \
+            KSU_SUSFS_SUS_MAP
+          do
+            grep -q "^CONFIG_$o=y" $DEFCONFIG || echo "CONFIG_$o=y" >> $DEFCONFIG
+          done
 
           # 4.14 arm64 没有 HAVE_ARCH_PREL32_RELOCATIONS,
           # ___ksymtab 存 64 位绝对地址 -> PIE 下新版 binutils 报
@@ -239,7 +256,14 @@ jobs:
 
           echo "=== boot-critical config ==="
           grep -E '^CONFIG_(KSU|KSU_SUSFS|RELOCATABLE|RANDOMIZE_BASE|UTS_NS|PSI|STATIC_USERMODEHELPER_PATH|SECURITY_SELINUX|FS_ENCRYPTION_INLINE_CRYPT|SCSI_UFS_QCOM_ICE)=' out/.config || true
-          if grep -q '^CONFIG_KSU=y' out/.config; then echo "KSU enabled"; else echo "ERROR: CONFIG_KSU not enabled"; exit 1; fi
+          echo "=== root/hide config in out/.config ==="
+          grep -E 'KSU|SUSFS' out/.config || true
+          for o in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG; do
+            grep -q "^$o=y" out/.config || { echo "ERROR: $o 没有生效, 隐藏功能会缺失"; exit 1; }
+          done
+          for o in CONFIG_THREAD_INFO_IN_TASK CONFIG_UTS_NS CONFIG_PSI; do
+            grep -q "^$o=y" out/.config || { echo "ERROR: $o != y, 出厂配置是 y"; exit 1; }
+          done
           if grep -q '^CONFIG_RELOCATABLE=y' out/.config; then echo "ERROR: RELOCATABLE=y 但代码非 PIE"; exit 1; fi
 
           set +e
@@ -277,12 +301,13 @@ jobs:
           path: |
             boot.img
             boot.img.md5
+            kernel/out/.config
           retention-days: 30
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ksun-susfs-cepheus-${{ env.kernel_commit_id }}
+          tag_name: ksun-susfs-cepheus-${{ env.kernel_commit_id }}-r${{ github.run_number }}
           body: |
             ## KernelSU-Next + SUSFS for Xiaomi Mi 9 (cepheus) — MIUI kernel tree
 
