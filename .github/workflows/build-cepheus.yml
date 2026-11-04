@@ -93,11 +93,11 @@ jobs:
           # 应用 SUSFS 4.14 的 KernelSU 侧补丁 (基于 v1.0.5, 精确 apply)
           # 注意: 当前在 kernel/KernelSU, 到 workspace 根要退两级
           cd KernelSU
-          if git apply "../../this-repo/patches/ksu-susfs-v105.patch"; then
+          if git apply "../../this-repo/cepheus/patches/ksu-susfs-v105.patch"; then
             echo "Applied ksu-susfs-v105.patch with git apply"
           else
             echo "git apply failed, trying patch command..."
-            patch -p1 --forward < "../../this-repo/patches/ksu-susfs-v105.patch"
+            patch -p1 --forward < "../../this-repo/cepheus/patches/ksu-susfs-v105.patch"
           fi
           # 不允许残留 reject, 有就立刻失败
           if find . -name '*.rej' | grep -q .; then
@@ -105,21 +105,21 @@ jobs:
           fi
 
           # 4.14 兼容: KernelSU v1.0.5 的 selinux.c 直接用 5.7+ 的 selinux_state
-          if git apply "../../this-repo/patches/ksu-4.14-selinux.patch"; then
+          if git apply "../../this-repo/cepheus/patches/ksu-4.14-selinux.patch"; then
             echo "Applied ksu-4.14-selinux.patch with git apply"
           else
             echo "git apply failed, trying patch command..."
-            patch -p1 --forward < "../../this-repo/patches/ksu-4.14-selinux.patch" || {
+            patch -p1 --forward < "../../this-repo/cepheus/patches/ksu-4.14-selinux.patch" || {
               echo "ERROR: ksu-4.14-selinux.patch failed"; exit 1
             }
           fi
           # 4.14 兼容: sepolicy.c / rules.c 依赖 5.x 的 policydb 结构
           # (type_val_to_struct 数组 / filename_trans_key / selinux_state.policy)
-          if git apply "../../this-repo/patches/ksu-4.14-sepolicy.patch"; then
+          if git apply "../../this-repo/cepheus/patches/ksu-4.14-sepolicy.patch"; then
             echo "Applied ksu-4.14-sepolicy.patch with git apply"
           else
             echo "git apply failed, trying patch command..."
-            patch -p1 --forward < "../../this-repo/patches/ksu-4.14-sepolicy.patch" || {
+            patch -p1 --forward < "../../this-repo/cepheus/patches/ksu-4.14-sepolicy.patch" || {
               echo "ERROR: ksu-4.14-sepolicy.patch failed"; exit 1
             }
           fi
@@ -145,11 +145,11 @@ jobs:
             allow-init-exec-ksud-under-nosuid.patch
           do
             echo "Applying kernel patch: $p"
-            if git apply "../this-repo/patches/$p"; then
+            if git apply "../this-repo/cepheus/patches/$p"; then
               echo "  -> git apply OK"
             else
               echo "  -> git apply failed, trying patch command..."
-              patch -p1 --forward < "../this-repo/patches/$p" || {
+              patch -p1 --forward < "../this-repo/cepheus/patches/$p" || {
                 echo "ERROR: $p could not be applied"; exit 1
               }
             fi
@@ -329,10 +329,10 @@ jobs:
 
       - name: Pack boot.img
         run: |
-          python3 this-repo/scripts/build_bootimg.py \
-            --header this-repo/prebuilt/cepheus-boot-header.bin \
+          python3 this-repo/cepheus/scripts/build_bootimg.py \
+            --header this-repo/cepheus/prebuilt/cepheus-boot-header.bin \
             --image kernel/out/arch/arm64/boot/Image \
-            --dtb this-repo/prebuilt/cepheus-stock-dtb.bin \
+            --dtb this-repo/cepheus/prebuilt/cepheus-stock-dtb.bin \
             --out boot.img
           ls -la boot.img
           md5sum boot.img | tee boot.img.md5
