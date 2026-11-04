@@ -172,6 +172,20 @@ jobs:
           echo "Werror flags after patch:"
           grep -n 'Werror' Makefile scripts/Makefile.build 2>/dev/null || echo "(none)"
 
+          # 小米内核自带的 scripts/gcc-wrapper.py 是 Python2 语法 (print >> sys.stderr),
+          # 在 Ubuntu 22.04 的 Python3 下直接崩溃; 而且它会把任何 gcc warning 当 error.
+          # 替换成 Python3 直通脚本, 只透传 gcc 的 stdout/stderr/退出码.
+          if [ -f scripts/gcc-wrapper.py ]; then
+            printf '%s\n' \
+              '#!/usr/bin/env python3' \
+              'import subprocess, sys' \
+              'sys.exit(subprocess.call(sys.argv[1:]))' \
+              > scripts/gcc-wrapper.py
+            chmod +x scripts/gcc-wrapper.py
+            echo "=== gcc-wrapper.py replaced ==="
+            cat scripts/gcc-wrapper.py
+          fi
+
       - name: Build kernel
         working-directory: kernel
         run: |
