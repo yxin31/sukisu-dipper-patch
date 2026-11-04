@@ -128,6 +128,14 @@ jobs:
           # 不用 clang 的 LTO
           sed -i 's/^CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' $DEFCONFIG
 
+          # 这三个是这棵树新加的符号 (kernel/cpu.c 用), 出厂 defconfig 里没有。
+          # 不给值的话 conf 会当成 NEW 符号弹交互, CI 下直接 abort。
+          # 数值取自同仓库的 cepheus_defconfig (0x0f / 0x70 / 0x80)。
+          for kv in LITTLE_CPU_MASK=15 BIG_CPU_MASK=112 PRIME_CPU_MASK=128; do
+            k=${kv%%=*}
+            grep -q "^CONFIG_$k=" $DEFCONFIG || echo "CONFIG_$kv" >> $DEFCONFIG
+          done
+
           # ---- 版本号伪装成原厂 (vermagic 必须完全一致) ----
           sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${{ env.stock_kernel_sublevel }}/" Makefile
           if grep -q '^CONFIG_LOCALVERSION=' $DEFCONFIG; then
@@ -193,6 +201,8 @@ jobs:
             KCFLAGS=-fcommon"
 
           $MK ${{ env.defconfig }}
+          # 兜底: 对任何仍未赋值的 NEW 符号取默认值, 避免 silentoldconfig 交互中止
+          $MK olddefconfig
 
           echo "=== boot-critical config ==="
           grep -E '^CONFIG_(KSU|KSU_SUSFS|RELOCATABLE|RANDOMIZE_BASE|UTS_NS|PSI|STATIC_USERMODEHELPER_PATH|SECURITY_SELINUX|FS_ENCRYPTION_INLINE_CRYPT|SCSI_UFS_QCOM_ICE)=' out/.config || true
