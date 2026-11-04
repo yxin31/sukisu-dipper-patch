@@ -218,6 +218,18 @@ jobs:
             cat scripts/gcc-wrapper.py
           fi
 
+          # GCC 11 的 __builtin_object_size 比 GCC 4.9 精确得多, 会让老驱动里
+          # "先检查边界再 copy_from_user" 的写法在编译期误报
+          # (__bad_copy_to: copy destination size is too small, 如 msm ipa3_write)。
+          # 让 __compiletime_object_size 恒返回 -1, 关闭这个编译期检查;
+          # 运行时的 CONFIG_HARDENED_USERCOPY (__check_object_size) 仍然保留。
+          if [ -f include/linux/compiler-gcc.h ]; then
+            sed -i 's/__compiletime_object_size(obj) __builtin_object_size(obj, 0)/__compiletime_object_size(obj) (-1)/' \
+              include/linux/compiler-gcc.h
+            echo "=== compiletime_object_size now ==="
+            grep -n 'compiletime_object_size' include/linux/compiler-gcc.h
+          fi
+
       - name: Build kernel
         working-directory: kernel
         run: |
