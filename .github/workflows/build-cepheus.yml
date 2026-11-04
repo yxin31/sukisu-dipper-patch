@@ -257,6 +257,17 @@ jobs:
             tail -4 arch/arm64/Makefile
           fi
 
+          # 小米/高通把 SELinux 等变量放进自定义 .bss.rtic 段, 但链接脚本
+          # (arch/arm64/kernel/vmlinux.lds.S) 把该段放在 _end / STABS_DEBUG
+          # 之后, GCC 11 下 ADRP 的 ±4GB 寻址直接溢出
+          # (R_AARCH64_ADR_PREL_PG_HI21 against ss_initialized)。
+          # 把 __rticdata 定义为空, 变量回到标准 .bss, 仍会被 __bss_start..stop 清零。
+          if [ -f include/linux/init.h ]; then
+            sed -i 's|^#define __rticdata.*|#define __rticdata|' include/linux/init.h
+            echo "=== __rticdata now ==="
+            grep -n '__rticdata' include/linux/init.h
+          fi
+
       - name: Build kernel
         working-directory: kernel
         run: |
