@@ -195,13 +195,22 @@ jobs:
           sed -i 's/^CONFIG_FORTIFY_SOURCE=y/# CONFIG_FORTIFY_SOURCE is not set/' $DEFCONFIG
           grep -q 'CONFIG_FORTIFY_SOURCE' $DEFCONFIG || echo '# CONFIG_FORTIFY_SOURCE is not set' >> $DEFCONFIG
 
-          # 【关键】关掉 DYNAMIC_DEBUG。
-          # 它会给每个 pr_debug 生成一个 __verbose 段条目, 段里存 absolute 地址;
-          # GCC 11 + 新版汇编器在 PIE 模式下对该段报
-          # "dangerous relocation: unsupported relocation"(msm gsi.o 首当其冲)。
-          # 之前用「关 PIE」来绕过, 结果破坏了 CONFIG_RELOCATABLE -> 不开机。
-          # 关掉 DYNAMIC_DEBUG 后 __verbose 段不再生成, PIE 得以保留。
-          # 代价: 失去 dynamic debug 的运行时开关(对日常使用无影响)。
+          # 【关键】关掉 KASLR: RELOCATABLE + RANDOMIZE_BASE 必须一起关。
+          # 原因见 Patch Makefiles 步骤里的长注释:
+          # 4.14 arm64 没有 HAVE_ARCH_PREL32_RELOCATIONS, ___ksymtab 存绝对地址,
+          # PIE 下编不过; 而关 PIE 又必须同时关 RELOCATABLE, 否则就是
+          # "声称可重定位、实际位置相关"的内核 -> 开机卡 Mi logo。
+          for opt in CONFIG_RELOCATABLE CONFIG_RANDOMIZE_BASE; do
+            sed -i "s/^$opt=y/# $opt is not set/" $DEFCONFIG
+            grep -q "$opt" $DEFCONFIG || echo "# $opt is not set" >> $DEFCONFIG
+          done
+          echo "=== KASLR disabled ==="
+          grep -E 'RELOCATABLE|RANDOMIZE_BASE' $DEFCONFIG
+
+          # 顺手关掉 DYNAMIC_DEBUG: 它会给每个 pr_debug 在 __verbose 段生成条目
+          # (段里存绝对地址), 在 PIE 下同样是 dangerous relocation 的来源之一。
+          # 既然已经不 PIE 了, 这个不是必需的, 但关掉能少一类重定位、少一点体积。
+          # 代价: 失去 dynamic debug 运行时开关(对日常使用无影响)。
           sed -i 's/^CONFIG_DYNAMIC_DEBUG=y/# CONFIG_DYNAMIC_DEBUG is not set/' $DEFCONFIG
           grep -q 'CONFIG_DYNAMIC_DEBUG' $DEFCONFIG || echo '# CONFIG_DYNAMIC_DEBUG is not set' >> $DEFCONFIG
 
@@ -256,21 +265,32 @@ jobs:
             grep -n 'compiletime_object_size' include/linux/compiler-gcc.h
           fi
 
-          # 【绝对不能关 PIE】原厂 config 是 CONFIG_RELOCATABLE=y +
-          # CONFIG_RANDOMIZE_BASE=y, 4.14 的 arch/arm64/Makefile 在这种情况下
-          # 会加 `-fpie` 和 `LDFLAGS_vmlinux += -pie -shared -Bsymbolic`,
-          # 内核靠 __relocate_kernel 在启动早期自定位。把它改成 -fno-PIE/-no-pie
-          # 会生成位置相关的内核, 与原厂启动假设置冲突 -> 黑屏不开机。
-          # 之前之所以想关 PIE, 是因为 dynamic debug 的 __verbose 段在 PIE 下
-          # 报 "dangerous relocation: unsupported relocation"(gsi.o)。
-          # 正确解法是关掉 CONFIG_DYNAMIC_DEBUG(见 Configure kernel 步骤),
-          # 而不是关 PIE。这里保留一个断言, 防止有人又把 PIE 关掉。
-          if grep -q 'fno-PIE' arch/arm64/Makefile 2>/dev/null; then
-            echo "ERROR: arch/arm64/Makefile 里出现了 -fno-PIE, 会破坏 CONFIG_RELOCATABLE/KASLR"
-            exit 1
+          # 【PIE / RELOCATABLE 必须自洽】这一对是本次"卡 Mi logo 不开机"的根因。
+          #
+          # 事实链:
+          #  1. 原厂 config: CONFIG_RELOCATABLE=y + CONFIG_RANDOMIZE_BASE=y。
+          #     此时 arch/arm64/Makefile 会加 -fpie 和 -pie -shared -Bsymbolic。
+          #  2. 但 4.14 的 arm64 还没有 HAVE_ARCH_PREL32_RELOCATIONS(4.19 才有),
+          #     struct kernel_symbol 存的是 64 位绝对地址。PIE 下往 ___ksymtab
+          #     里写绝对地址, 新版汇编器直接报
+          #       gsi.o:(___ksymtab+xxx+0x0): dangerous relocation: unsupported relocation
+          #     GCC 4.9 时代的 binutils 不检查这个, 所以原厂能编过, GCC 11 不能。
+          #  3. 于是只能关 PIE。但如果只关 PIE 而保留 RELOCATABLE=y, 就得到一个
+          #     "声称可重定位、实际位置相关"的内核: head.S 里 __relocate_kernel
+          #     仍会被调用, 结果开机卡在 Mi logo 不动。
+          #
+          # 自洽的解法只有两条: backport PREL32(改动大), 或者彻底放弃 KASLR。
+          # 这里选后者: 同时关掉 RELOCATABLE 和 RANDOMIZE_BASE(它俩是依赖关系),
+          # 内核按 Image header 的 text_offset 固定加载, 不再做自定位。
+          # 代价: 没有 KASLR —— 只是少一层缓解, 与 root/SUSFS 隐藏无关。
+          if [ -f arch/arm64/Makefile ]; then
+            grep -q 'KBUILD_CFLAGS += -fno-PIE' arch/arm64/Makefile || \
+              printf '\nKBUILD_CFLAGS += -fno-PIE\nLDFLAGS_vmlinux += -no-pie\n' >> arch/arm64/Makefile
+            # 关 PIE 之后 arch/arm64/Makefile 里的 -pie -shared -Bsymbolic 段
+            # 因 CONFIG_RELOCATABLE=n 不再成立, 不会加进来。
+            echo "=== arm64 Makefile tail ==="
+            tail -4 arch/arm64/Makefile
           fi
-          echo "=== arm64 PIE flags (must be intact) ==="
-          grep -n 'fpie\|LDFLAGS_vmlinux' arch/arm64/Makefile | head -20 || true
 
           # 去掉 scripts/setlocalversion 自动追加的 "+"。
           # 内核源码是 git 仓库, 打完补丁后 working tree 变 dirty, 4.14 的
@@ -295,11 +315,22 @@ jobs:
             grep -n '__rticdata' include/linux/init.h
           fi
 
-          # KALLSYMS 保持原厂配置 (CONFIG_KALLSYMS_BASE_RELATIVE=y)。
-          # 之前把它改成 n 是为了绕开 "-no-pie 下 relative 模式找不到 _text" 的错误,
-          # 现在 PIE 保住了, relative 模式正常工作, 不需要也不应该动它。
-          echo "=== KALLSYMS_BASE_RELATIVE (leave default) ==="
-          grep -A4 '^config KALLSYMS_BASE_RELATIVE$' init/Kconfig || true
+          # 非 PIE + -no-pie 链接下, kallsyms 的 relative 模式找不到基准符号 _text,
+          # 报 "relative symbol value 0xffffff8008080000 out of range in relative mode"。
+          # CONFIG_KALLSYMS_BASE_RELATIVE 在本内核里是
+          #   default !IA64 && !(TILE && 64BIT)   (不是 default y!)
+          # 且无 prompt, defconfig 关不掉, 只能改 Kconfig 的 default。
+          # 注意: 必须在本步骤(早于 Build kernel 里的 make defconfig)完成,
+          # 否则 .config 已经按旧 default 生成, 改了也不生效。
+          if [ -f init/Kconfig ]; then
+            sed -i '/^config KALLSYMS_BASE_RELATIVE$/,/^config /{s/^\tdefault .*/\tdefault n/}' init/Kconfig
+            echo "=== KALLSYMS_BASE_RELATIVE ==="
+            grep -A4 '^config KALLSYMS_BASE_RELATIVE$' init/Kconfig
+            if sed -n '/^config KALLSYMS_BASE_RELATIVE$/,/^config /p' init/Kconfig | grep -q 'default !IA64'; then
+              echo "ERROR: failed to rewrite KALLSYMS_BASE_RELATIVE default"
+              exit 1
+            fi
+          fi
 
       - name: Build kernel
         working-directory: kernel
@@ -317,12 +348,16 @@ jobs:
           echo "=== KSU / KPROBES / SUSFS config ==="
           grep -iE "CONFIG_KSU|CONFIG_KPROBES|CONFIG_LOCALVERSION" out/.config || true
 
-          # 硬校验: RELOCATABLE / KASLR 必须是 y, 且 PIE 标志没被破坏。
-          # 这两项决定内核能不能起来, 比 SUSFS 重要得多。
+          # 硬校验: KASLR 必须已关闭(否则又回到"声称可重定位、实际非 PIE"的死状态),
+          # kallsyms 必须是绝对值模式。这三项决定能不能开机。
           echo "=== boot-critical config ==="
-          grep -E '^CONFIG_(RELOCATABLE|RANDOMIZE_BASE|KALLSYMS_BASE_RELATIVE)=' out/.config
-          if ! grep -q '^CONFIG_RELOCATABLE=y' out/.config; then
-            echo "ERROR: CONFIG_RELOCATABLE != y, 内核将无法自定位 (原厂是 y)"
+          grep -E '^CONFIG_(RELOCATABLE|RANDOMIZE_BASE)=|KALLSYMS_BASE_RELATIVE' out/.config || true
+          if grep -q '^CONFIG_RELOCATABLE=y' out/.config; then
+            echo "ERROR: CONFIG_RELOCATABLE 还是 y, 但代码是非 PIE 的 -> 开机必卡 logo"
+            exit 1
+          fi
+          if grep -q '^CONFIG_KALLSYMS_BASE_RELATIVE=y' out/.config; then
+            echo "ERROR: kallsyms base-relative 没关掉, vmlinux 链接会失败"
             exit 1
           fi
 
