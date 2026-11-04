@@ -1,0 +1,257 @@
+name: Build KernelSU + SUSFS for Xiaomi Mi 9 (cepheus)
+
+env:
+  # 小米9 官方内核源码, cepheus-q-oss = Android 10 基线, kernel 4.14.117
+  # (小米从未开源 MIUI 12.5 / Android 11 用的 4.14.180)
+  # 固定到具体 commit, 保证补丁能精确 apply
+  kernel_repository: MiCode/Xiaomi_Kernel_OpenSource
+  kernel_ref: 192eca8550f95c2eec58a474793d1d93fc1b3b67
+  # SUSFS 4.14 (v1.5.9) 的 KernelSU 侧补丁基于 upstream KernelSU v1.0.5
+  ksu_repository: tiann/KernelSU
+  ksu_ref: v1.0.5
+  device: cepheus
+  defconfig: cepheus_user_defconfig
+  # 伪装成原厂版本号, 让 ramdisk/vendor 里的 .ko vermagic 能对上
+  stock_kernel_sublevel: 180
+  stock_localversion: "-perf-gb24d113"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: "KernelSU tag (default: v1.0.5)"
+        required: false
+        default: "v1.0.5"
+      kernel_ref:
+        description: "Kernel commit to build (default: pinned cepheus-q-oss HEAD)"
+        required: false
+        default: "192eca8550f95c2eec58a474793d1d93fc1b3b67"
+      allow_rebuild:
+        description: "Force rebuild"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: Build kernel
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Set env
+        run: |
+          echo "ksu_ref=${{ inputs.ksu_ref || env.ksu_ref }}" | tee -a $GITHUB_ENV
+          echo "kernel_ref=${{ inputs.kernel_ref || env.kernel_ref }}" | tee -a $GITHUB_ENV
+
+      - name: Install packages
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            binutils-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            bc bison flex \
+            libssl-dev libelf-dev \
+            python3 cpio
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.kernel_repository }}
+          ref: ${{ env.kernel_ref }}
+          path: kernel
+
+      - name: Checkout this repo (patches + prebuilt)
+        uses: actions/checkout@v4
+        with:
+          path: this-repo
+
+      - name: Get kernel commit info
+        working-directory: kernel
+        run: |
+          echo "kernel_commit_id=$(git rev-parse --short HEAD)" | tee -a $GITHUB_ENV
+          echo "kernel_upstream_version=$(make kernelversion 2>/dev/null || echo 4.14.117)" | tee -a $GITHUB_ENV
+
+      - name: Clone KernelSU + apply SUSFS patch
+        working-directory: kernel
+        run: |
+          # upstream KernelSU v1.0.5 (SUSFS 4.14 补丁的基准)
+          git clone --depth 1 --branch "${{ env.ksu_ref }}" \
+            "https://github.com/${{ env.ksu_repository }}.git" KernelSU
+          echo "=== KernelSU HEAD ==="
+          git -C KernelSU log --oneline -1
+
+          # 应用 SUSFS 4.14 的 KernelSU 侧补丁 (基于 v1.0.5, 精确 apply)
+          cd KernelSU
+          if git apply "../this-repo/cepheus/patches/ksu-susfs-v105.patch"; then
+            echo "Applied ksu-susfs-v105.patch with git apply"
+          else
+            echo "git apply failed, trying patch command..."
+            patch -p1 --forward < "../this-repo/cepheus/patches/ksu-susfs-v105.patch"
+          fi
+          # 不允许残留 reject, 有就立刻失败
+          if find . -name '*.rej' | grep -q .; then
+            echo "ERROR: SUSFS KSU patch left .rej files"; find . -name '*.rej'; exit 1
+          fi
+          cd ..
+
+          # 建立 drivers/kernelsu 软链 + 挂进 Makefile/Kconfig (等价于官方 setup.sh)
+          ln -sf ../KernelSU/kernel drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          echo "=== drivers/kernelsu -> ==="
+          ls -l drivers/kernelsu
+          echo "=== KSU Kconfig SUSFS options ==="
+          grep -c 'config KSU_SUSFS' drivers/kernelsu/Kconfig
+
+      - name: Apply kernel patches
+        working-directory: kernel
+        run: |
+          # 顺序很重要: 先打 SUSFS 内核侧大补丁, 再打 path_umount / nosuid
+          for p in \
+            cepheus-susfs-kernel.patch \
+            backport-path-umount.patch \
+            allow-init-exec-ksud-under-nosuid.patch
+          do
+            echo "Applying kernel patch: $p"
+            if git apply "../this-repo/cepheus/patches/$p"; then
+              echo "  -> git apply OK"
+            else
+              echo "  -> git apply failed, trying patch command..."
+              patch -p1 --forward < "../this-repo/cepheus/patches/$p" || {
+                echo "ERROR: $p could not be applied"; exit 1
+              }
+            fi
+          done
+          # 确认 SUSFS 新文件就位
+          ls -l fs/susfs.c fs/sus_su.c include/linux/susfs.h include/linux/susfs_def.h include/linux/sus_su.h
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          DEFCONFIG=arch/arm64/configs/${{ env.defconfig }}
+
+          # 非 GKI + KPROBES root 所需
+          grep -q "CONFIG_KPROBES=y" $DEFCONFIG || echo 'CONFIG_KPROBES=y' >> $DEFCONFIG
+          grep -q "CONFIG_KPROBE_EVENTS=y" $DEFCONFIG || echo 'CONFIG_KPROBE_EVENTS=y' >> $DEFCONFIG
+          grep -q "CONFIG_KSU=y" $DEFCONFIG || echo 'CONFIG_KSU=y' >> $DEFCONFIG
+          # SUSFS 隐藏 root 的核心开关 (其余子选项默认 y)
+          grep -q "CONFIG_KSU_SUSFS=y" $DEFCONFIG || echo 'CONFIG_KSU_SUSFS=y' >> $DEFCONFIG
+
+          # 关闭 stack protector, 规避 GCC 11 + 4.14 的兼容问题
+          sed -i 's/^CONFIG_CC_STACKPROTECTOR_STRONG=y/# CONFIG_CC_STACKPROTECTOR_STRONG is not set/' $DEFCONFIG
+          sed -i 's/^CONFIG_CC_STACKPROTECTOR=y/# CONFIG_CC_STACKPROTECTOR is not set/' $DEFCONFIG
+
+          # 版本号对齐原厂 (4.14.180-perf-gb24d113), 只为 vermagic 匹配
+          sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${{ env.stock_kernel_sublevel }}/" Makefile
+          if grep -q '^CONFIG_LOCALVERSION=' $DEFCONFIG; then
+            sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"${{ env.stock_localversion }}\"|" $DEFCONFIG
+          else
+            echo "CONFIG_LOCALVERSION=\"${{ env.stock_localversion }}\"" >> $DEFCONFIG
+          fi
+          sed -i 's/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' $DEFCONFIG
+
+          echo "=== version alignment ==="
+          head -5 Makefile | grep -E "VERSION|PATCHLEVEL|SUBLEVEL"
+          grep '^CONFIG_LOCALVERSION' $DEFCONFIG
+
+      - name: Patch Makefiles for GCC compatibility
+        working-directory: kernel
+        run: |
+          for f in Makefile scripts/Makefile.build; do
+            [ -f "$f" ] || continue
+            sed -i 's/-Werror=/-Wno-error=/g' "$f"
+            sed -i 's/-Werror\([^a-zA-Z=-]\)/-Wno-error\1/g' "$f"
+            sed -i 's/-Werror$/-Wno-error/g' "$f"
+          done
+          echo "Werror flags after patch:"
+          grep -n 'Werror' Makefile scripts/Makefile.build 2>/dev/null || echo "(none)"
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          set -x
+          CFLAGS_EXTRA="-fcommon -w"
+
+          make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            HOSTCC=gcc HOSTCFLAGS="-fcommon" \
+            KCFLAGS="$CFLAGS_EXTRA" \
+            ${{ env.defconfig }}
+
+          echo "=== KSU / KPROBES / SUSFS config ==="
+          grep -iE "CONFIG_KSU|CONFIG_KPROBES|CONFIG_LOCALVERSION" out/.config || true
+
+          make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            HOSTCC=gcc HOSTCFLAGS="-fcommon" \
+            KCFLAGS="$CFLAGS_EXTRA" \
+            -j$(nproc --all) Image 2>&1 | tee build.log
+
+          ls -la out/arch/arm64/boot/Image || {
+            echo "ERROR: Image not found!"
+            echo "=== tail of build.log ==="
+            tail -80 build.log || true
+            exit 1
+          }
+          echo "=== built kernel release ==="
+          cat out/include/config/kernel.release 2>/dev/null || true
+
+      - name: Pack boot.img
+        run: |
+          python3 this-repo/cepheus/scripts/build_bootimg.py \
+            --header this-repo/cepheus/prebuilt/cepheus-boot-header.bin \
+            --image kernel/out/arch/arm64/boot/Image \
+            --dtb this-repo/cepheus/prebuilt/cepheus-stock-dtb.bin \
+            --out boot.img
+          ls -la boot.img
+          md5sum boot.img | tee boot.img.md5
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernelSU-SUSFS-cepheus-boot
+          path: |
+            boot.img
+            boot.img.md5
+          retention-days: 30
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ksususfs-${{ env.ksu_ref }}-cepheus-${{ env.kernel_commit_id }}
+          body: |
+            ## KernelSU + SUSFS for Xiaomi Mi 9 (cepheus)
+
+            **Device:** Xiaomi Mi 9 (cepheus) / MIUI 12.5 (Android 11)
+            **Kernel source:** cepheus-q-oss (upstream ${{ env.kernel_upstream_version }}, ${{ env.kernel_commit_id }})
+            **Reported version:** 4.14.${{ env.stock_kernel_sublevel }}${{ env.stock_localversion }} (vermagic aligned to stock)
+            **Root:** KernelSU ${{ env.ksu_ref }} (KPROBES, non-GKI)
+            **Hide:** SUSFS 4.14 (v1.5.9)
+
+            `boot.img` keeps the stock header, stock dtb and stock cmdline, only the kernel Image is replaced.
+
+            ### Flash
+            ```
+            fastboot flash boot boot.img
+            ```
+
+            ### Restore
+            ```
+            fastboot flash boot <your-stock-boot.img>
+            ```
+
+            ### 开机后
+            - 安装 KernelSU Manager (v1.0.x) 授予 root。
+            - 安装 SUSFS 模块 + `ksu_susfs` 工具 (来自 susfs4ksu 仓库的 `ksu_module_susfs`), 用于实际配置隐藏路径/挂载。
+
+            > Flash at your own risk. Keep a copy of your stock boot.img.
+          files: |
+            boot.img
+            boot.img.md5
