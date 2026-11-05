@@ -462,11 +462,22 @@ jobs:
         working-directory: kernel
         run: |
           set -x
+          # 注意这里没有 KCFLAGS=-fcommon !!
+          #
+          # 内核主体 (Image) 必须 -fcommon: GCC 10 起默认 -fno-common, 4.14 老代码里
+          # 同一 header 有多处 `int foo;` 定义, 不开 -fcommon 会 multiple definition。
+          #
+          # 但模块反过来必须 -fno-common: kernel/module.c 的 simplify_symbols() 遇到
+          # SHN_COMMON 符号会
+          #     pr_err("%s: please compile with -fno-common\n", mod->name);
+          #     return -ENOEXEC;
+          # 于是 insmod 报 "Exec format error"。实机验证过, 就是这么栽的:
+          #     wlan: please compile with -fno-common   (刷屏 24 次)
+          #     insmod: failed to load ...: Exec format error
           MK="make O=out ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            HOSTCC=gcc HOSTCFLAGS=-fcommon \
-            KCFLAGS=-fcommon"
+            HOSTCC=gcc HOSTCFLAGS=-fcommon"
 
           echo "=== wlan stack config 生效情况 ==="
           grep -E '^CONFIG_(CNSS|CNSS2|QCA_CLD_WLAN)' out/.config || true
@@ -474,9 +485,13 @@ jobs:
             grep -q "^$o=m" out/.config || { echo "ERROR: $o 没生效, 编不出 wi-fi 模块"; exit 1; }
           done
 
+          # 必须先删掉这两个目录的 .o: make 不跟踪 KCFLAGS 变化, 不删就会直接复用
+          # 之前用 -fcommon 编出来的目标文件, 出来的 .ko 照样带 COMMON 符号。
+          rm -rf out/drivers/staging/qcacld-3.0 out/drivers/net/wireless/cnss2
+
           # -k: 树里其它 =m 的驱动坏掉不要连累 wifi
           set +e
-          $MK -j$(nproc --all) -k modules 2>&1 | tee modules.log
+          $MK KCFLAGS=-fno-common -j$(nproc --all) -k modules 2>&1 | tee modules.log
           set -e
 
           echo "=== 生成的 .ko ==="
@@ -489,6 +504,16 @@ jobs:
             || { echo "ERROR: wlan.ko 没编出来"
                  grep -nE 'error:|Error [0-9]|ERROR:' modules.log | tail -40
                  exit 1; }
+
+          # 硬校验: .ko 里不许有 COMMON 符号, 否则装到手机上必然 Exec format error
+          echo "=== COMMON 符号检查 (必须为空) ==="
+          for f in out/drivers/staging/qcacld-3.0/wlan.ko \
+                   out/drivers/net/wireless/cnss2/cnss2.ko; do
+            [ -f "$f" ] || continue
+            n=$(aarch64-linux-gnu-readelf -sW "$f" 2>/dev/null | awk '$7=="COM"{c++} END{print c+0}')
+            echo "$(basename $f): COM=$n"
+            [ "$n" = "0" ] || { echo "ERROR: $(basename $f) 还有 $n 个 COMMON 符号"; exit 1; }
+          done
           echo "wlan.ko OK"
 
           # 树里开了 CONFIG_DEBUG_INFO, wlan.ko 会到 300MB+, 根本推不进手机。
