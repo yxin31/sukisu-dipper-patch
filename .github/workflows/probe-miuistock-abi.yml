@@ -117,6 +117,19 @@ jobs:
           # verbose 编译期数组越界检查会让老代码大批报错
           sed -i 's/^CONFIG_CC_OPTIMIZE_FOR_SIZE=y/# CONFIG_CC_OPTIMIZE_FOR_SIZE is not set/' arch/arm64/configs/cepheus_stock_defconfig || true
 
+      - name: Fix stock tree so it can link
+        working-directory: kernel
+        run: |
+          # run 41970947258 的两个链接错误就靠这一步修:
+          #  1) .bss.rtic 被摆在地址 0 附近 -> R_AARCH64_ADR_PREL_PG_HI21 溢出
+          #  2) is_tp_doubleclick_enable 没有定义 -> CONFIG_..._DOUBLE_CLICK 没开
+          # 详细推理见 scripts/fix-stock-tree.py 的文件头注释。
+          python3 this-repo/scripts/fix-stock-tree.py
+          echo "=== 确认补丁生效 ==="
+          grep -n "RTIC_BSS" arch/arm64/kernel/vmlinux.lds.S
+          grep -n "__bss_stop" arch/arm64/kernel/vmlinux.lds.S
+          grep -n "DAVINCI_DOUBLE_CLICK" arch/arm64/configs/cepheus_stock_defconfig
+
       - name: Configure
         working-directory: kernel
         run: |
@@ -127,6 +140,11 @@ jobs:
           grep -E '^# CONFIG_MODVERSIONS' .config || true
           echo "=== KERNELRELEASE ==="
           make -s ARCH=arm64 kernelrelease
+          echo "=== 双击驱动必须真的被选中, 否则链接期会 undefined reference ==="
+          grep -q '^CONFIG_TOUCHSCREEN_MI_DAVINCI_DOUBLE_CLICK=y' .config \
+            || { echo "##[error] DOUBLE_CLICK 被 kconfig 丢了, 链接一定会失败"; exit 1; }
+          grep -q '^CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE=y' .config \
+            || echo "##[warning] XIAOMI_TOUCHFEATURE 被 kconfig 丢了"
 
       - name: Build kernel
         working-directory: kernel
