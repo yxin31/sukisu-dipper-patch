@@ -225,8 +225,14 @@ jobs:
             }
             add_cfg 'CONFIG_CNSS2=m'
             add_cfg 'CONFIG_CNSS2_QMI=y'
-            add_cfg 'CONFIG_CNSS_UTILS=m'
-            add_cfg 'CONFIG_CNSS_PREALLOC=m'
+            # CNSS_UTILS 的 Kconfig 是 bool (drivers/net/wireless/cnss_utils/Kconfig),
+            # 写 =m 会被 kconfig 判非法然后静默丢弃 -> 编不出模块也编不进内核。
+            # 它没有独立 .ko 的必要, 直接内建, 顺带把原厂 cnss_utils.ko 的 ABI
+            # 风险一并消掉 (原厂那个会被 check_version 拒之门外, 用的就是这个)。
+            add_cfg 'CONFIG_CNSS_UTILS=y'
+            # 符号名是 WCNSS_MEM_PRE_ALLOC, 不是 CNSS_PREALLOC (那个根本不存在,
+            # 写了等于没写, 之前 cnss_prealloc.ko 编不出来就是这个原因)
+            add_cfg 'CONFIG_WCNSS_MEM_PRE_ALLOC=m'
             add_cfg 'CONFIG_QCA_CLD_WLAN=m'
             # DVB_MPQ_DEMUX 是出厂 defconfig 里遗留的 =m, 它引用的
             # ion_alloc_dmabuf 在 ION 没开任何 heap 时不存在, modpost 会直接
@@ -365,6 +371,16 @@ jobs:
             grep -q "^$o=y" out/.config || { echo "ERROR: $o != y, struct module 布局会与出厂不一致"; exit 1; }
           done
           echo "abi_mode=${{ env.abi_mode }}"
+          if [ "${{ env.build_vendor_mods }}" = "true" ]; then
+            echo "=== vendor wifi stack in out/.config ==="
+            grep -E '^CONFIG_(CNSS2|CNSS_UTILS|WCNSS_MEM_PRE_ALLOC|QCA_CLD_WLAN)' out/.config || true
+            for o in CONFIG_CNSS2 CONFIG_QCA_CLD_WLAN CONFIG_WCNSS_MEM_PRE_ALLOC; do
+              grep -q "^$o=m" out/.config || { echo "ERROR: $o != m, 编不出 wifi .ko"; exit 1; }
+            done
+            # bool 项, 只能内建
+            grep -q '^CONFIG_CNSS_UTILS=y' out/.config \
+              || { echo "ERROR: CONFIG_CNSS_UTILS != y (它是 bool, 写 =m 会被丢弃)"; exit 1; }
+          fi
           if [ "${{ env.abi_mode }}" = "permissive" ]; then
             grep -q '^# CONFIG_MODVERSIONS is not set' out/.config \
               || { echo "ERROR: permissive 模式下 MODVERSIONS 必须关闭"; exit 1; }
@@ -470,6 +486,22 @@ jobs:
                  exit 1; }
           echo "wlan.ko OK"
 
+          # 树里开了 CONFIG_DEBUG_INFO, wlan.ko 会到 300MB+, 根本推不进手机。
+          # strip --strip-debug 只删调试段, .modinfo / __versions / .symtab 都留着,
+          # 不影响加载。
+          echo "=== strip 调试信息 ==="
+          for f in out/drivers/staging/qcacld-3.0/wlan.ko \
+                   out/drivers/net/wireless/cnss2/cnss2.ko \
+                   out/drivers/net/wireless/cnss_prealloc/cnss_prealloc.ko; do
+            [ -f "$f" ] || continue
+            before=$(stat -c %s "$f")
+            aarch64-linux-gnu-strip --strip-debug "$f" 2>/dev/null || true
+            after=$(stat -c %s "$f")
+            echo "$(basename $f): $((before/1024/1024))MB -> $((after/1024/1024))MB"
+          done
+          echo "=== strip 后 ==="
+          ls -la out/drivers/staging/qcacld-3.0/wlan.ko out/drivers/net/wireless/cnss2/cnss2.ko 2>/dev/null || true
+
       - name: Package vendor modules
         if: ${{ env.build_vendor_mods == 'true' }}
         run: |
@@ -478,21 +510,32 @@ jobs:
           rm -rf $OUT && mkdir -p $OUT
           # 设备上的文件名 <- 我们的模块名。MIUI 把 qcacld 的 wlan.ko 改名成
           # qca_cld3_wlan.ko, 其余同名。
+          # cnss_utils 是 bool 已内建进 vmlinux, 这里不再有 .ko。
           cp kernel/out/drivers/staging/qcacld-3.0/wlan.ko $OUT/qca_cld3_wlan.ko
-          cp kernel/out/drivers/net/wireless/cnss2/cnss2.ko $OUT/ 2>/dev/null || true
-          cp kernel/out/drivers/net/wireless/cnss_utils/cnss_utils.ko $OUT/ 2>/dev/null || true
+          cp kernel/out/drivers/net/wireless/cnss2/cnss2.ko $OUT/
           cp kernel/out/drivers/net/wireless/cnss_prealloc/cnss_prealloc.ko $OUT/ 2>/dev/null || true
-          # 其它可能存在的 wlan 相关模块, 有就带上 (wlan.ko 已改名, 排除)
-          find kernel/out -name '*.ko' | grep -iE 'cnss|wlan|qca' | grep -v '/wlan\.ko$' | while read f; do
-            cp -n "$f" $OUT/ 2>/dev/null || true
-          done
           ls -la $OUT
+
+          # wlan.ko 忘了 strip 会是 300MB+, 手机 /vendor 分区放不下
+          sz=$(stat -c %s $OUT/qca_cld3_wlan.ko)
+          if [ "$sz" -gt 63000000 ]; then
+            echo "ERROR: qca_cld3_wlan.ko 还有 $((sz/1024/1024))MB, 看样子没 strip 成功"
+            exit 1
+          fi
+
+          echo "=== vermagic 核对 (必须与设备内核实测一致) ==="
+          for f in $OUT/*.ko; do
+            echo "--- $f"
+            aarch64-linux-gnu-strings -a "$f" | grep -m1 '^vermagic=' || echo "(no vermagic)"
+          done
+
           cp this-repo/tools/install-vendor-modules.sh $OUT/install.sh
           {
             echo "# 由 $(git -C this-repo rev-parse --short HEAD) 于 $(date -u) 生成"
             echo "# kernel.release: $(cat kernel/out/include/config/kernel.release)"
             echo "# 目标: /vendor/lib/modules"
-            ls $OUT
+            echo "# kernel_commit: $(git -C kernel rev-parse --short HEAD)"
+            ls -la $OUT
           } > $OUT/MANIFEST
           tar -czf vendor-modules.tar.gz -C $OUT .
           ls -la vendor-modules.tar.gz
