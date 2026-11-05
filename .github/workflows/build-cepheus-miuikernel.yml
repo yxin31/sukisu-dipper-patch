@@ -230,9 +230,13 @@ jobs:
             # 它没有独立 .ko 的必要, 直接内建, 顺带把原厂 cnss_utils.ko 的 ABI
             # 风险一并消掉 (原厂那个会被 check_version 拒之门外, 用的就是这个)。
             add_cfg 'CONFIG_CNSS_UTILS=y'
-            # 符号名是 WCNSS_MEM_PRE_ALLOC, 不是 CNSS_PREALLOC (那个根本不存在,
-            # 写了等于没写, 之前 cnss_prealloc.ko 编不出来就是这个原因)
-            add_cfg 'CONFIG_WCNSS_MEM_PRE_ALLOC=m'
+            # 符号名是 WCNSS_MEM_PRE_ALLOC, 不是 CNSS_PREALLOC (那个根本不存在)。
+            # 它必须 =y 内建, 不能编成模块: 这棵树的 cnss_prealloc.c:387 写了
+            #   MODULE_DESCRIPTION(DEVICE "WCNSS Prealloc Driver");
+            # 而 DEVICE 宏全树都没有定义。内建时 MODULE_DESCRIPTION 展开成空,
+            # 所以出厂 defconfig 的 =y 一直没事; 一旦 -DMODULE, 它就变成
+            # MODULE_INFO(description, DEVICE "..." ) -> "expected ',' or ';' before 'DEVICE'"。
+            add_cfg 'CONFIG_WCNSS_MEM_PRE_ALLOC=y'
             add_cfg 'CONFIG_QCA_CLD_WLAN=m'
             # DVB_MPQ_DEMUX 是出厂 defconfig 里遗留的 =m, 它引用的
             # ion_alloc_dmabuf 在 ION 没开任何 heap 时不存在, modpost 会直接
@@ -374,12 +378,13 @@ jobs:
           if [ "${{ env.build_vendor_mods }}" = "true" ]; then
             echo "=== vendor wifi stack in out/.config ==="
             grep -E '^CONFIG_(CNSS2|CNSS_UTILS|WCNSS_MEM_PRE_ALLOC|QCA_CLD_WLAN)' out/.config || true
-            for o in CONFIG_CNSS2 CONFIG_QCA_CLD_WLAN CONFIG_WCNSS_MEM_PRE_ALLOC; do
+            for o in CONFIG_CNSS2 CONFIG_QCA_CLD_WLAN; do
               grep -q "^$o=m" out/.config || { echo "ERROR: $o != m, 编不出 wifi .ko"; exit 1; }
             done
-            # bool 项, 只能内建
-            grep -q '^CONFIG_CNSS_UTILS=y' out/.config \
-              || { echo "ERROR: CONFIG_CNSS_UTILS != y (它是 bool, 写 =m 会被丢弃)"; exit 1; }
+            # 这两项只能内建 (bool / 源码在 MODULE 下编不过)
+            for o in CONFIG_CNSS_UTILS CONFIG_WCNSS_MEM_PRE_ALLOC; do
+              grep -q "^$o=y" out/.config || { echo "ERROR: $o != y (它只能内建)"; exit 1; }
+            done
           fi
           if [ "${{ env.abi_mode }}" = "permissive" ]; then
             grep -q '^# CONFIG_MODVERSIONS is not set' out/.config \
@@ -491,8 +496,7 @@ jobs:
           # 不影响加载。
           echo "=== strip 调试信息 ==="
           for f in out/drivers/staging/qcacld-3.0/wlan.ko \
-                   out/drivers/net/wireless/cnss2/cnss2.ko \
-                   out/drivers/net/wireless/cnss_prealloc/cnss_prealloc.ko; do
+                   out/drivers/net/wireless/cnss2/cnss2.ko; do
             [ -f "$f" ] || continue
             before=$(stat -c %s "$f")
             aarch64-linux-gnu-strip --strip-debug "$f" 2>/dev/null || true
@@ -510,10 +514,9 @@ jobs:
           rm -rf $OUT && mkdir -p $OUT
           # 设备上的文件名 <- 我们的模块名。MIUI 把 qcacld 的 wlan.ko 改名成
           # qca_cld3_wlan.ko, 其余同名。
-          # cnss_utils 是 bool 已内建进 vmlinux, 这里不再有 .ko。
+          # cnss_utils / cnss_prealloc 都是内建进 vmlinux 的, 这里不再有 .ko。
           cp kernel/out/drivers/staging/qcacld-3.0/wlan.ko $OUT/qca_cld3_wlan.ko
           cp kernel/out/drivers/net/wireless/cnss2/cnss2.ko $OUT/
-          cp kernel/out/drivers/net/wireless/cnss_prealloc/cnss_prealloc.ko $OUT/ 2>/dev/null || true
           ls -la $OUT
 
           # wlan.ko 忘了 strip 会是 300MB+, 手机 /vendor 分区放不下
@@ -583,6 +586,25 @@ jobs:
             fastboot flash boot boot.img
             fastboot reboot
             ```
+
+            ### WiFi 模块 (本包含 wlan stack 时)
+            本包同时提供 `vendor-modules.tar.gz`, 内含用同一棵内核树编出来的
+            `qca_cld3_wlan.ko` / `cnss2.ko` / `cnss_prealloc.ko`。
+
+            出厂的 vendor DLKM 是按 4.14.180 的布局编的, 与本树 (4.14.357 代码 +
+            4.14.180 版本号) 结构体有漂移, 会被 `check_version()` 拒载 —— 这就是
+            "刷完没 WiFi" 的原因。换成同源模块即可, 不需要对齐 ABI。
+
+            **首次开机 wifi 大概率仍不可用**, 这是预期: 内核已是新的, 模块还是出厂的。
+            开机后:
+            ```
+            adb push vendor-modules.tar.gz /data/local/tmp/
+            adb shell su -c 'mkdir -p /data/local/tmp/vm && \
+              tar -xzf /data/local/tmp/vendor-modules.tar.gz -C /data/local/tmp/vm && \
+              sh /data/local/tmp/vm/install.sh'
+            adb reboot
+            ```
+            回滚: `install.sh` 会把原厂 .ko 备份到 `/data/local/tmp/vendor-modules-backup`。
 
             ### Restore
             ```
