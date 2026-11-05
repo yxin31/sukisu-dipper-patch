@@ -168,22 +168,21 @@ jobs:
           sed -i 's/^CONFIG_FORTIFY_SOURCE=y/# CONFIG_FORTIFY_SOURCE is not set/' $DEFCONFIG
           grep -q 'CONFIG_FORTIFY_SOURCE' $DEFCONFIG || echo '# CONFIG_FORTIFY_SOURCE is not set' >> $DEFCONFIG
 
-          # ---- vendor DLKM 兼容性: 关 MODVERSIONS, 但保留 vermagic 里的 modversions 标记 ----
-          # 实机 dmesg 证据: 27 次 "disagrees about version of symbol module_layout",
-          # 14 个 vendor 模块加载失败 (wlan / wcd_core / swr / q6_pdr / tas2557 /
-          # tfa98xx / cs35l41 / wcd_spi / pinctrl_wcd / stub / exfat / rmnet_perf /
-          # hdmi / wglink), 表现为 WiFi 无 wlan0、音频 codec 不工作。
-          # 原因: vendor 的 .ko 用原厂 4.14.180 的 CRC 编译, 我们这棵树是 4.14.357,
-          # module_layout 等符号 CRC 必然不同。
-          # 关掉 CONFIG_MODVERSIONS 后 find_symbol 拿不到 __crc_*, check_version() 直接放行;
-          # 但 vermagic 字符串里必须仍有 "modversions", 否则会变成
-          # "version magic '... modversions aarch64' should be '... aarch64'" 一样装载失败。
-          sed -i 's/^CONFIG_MODVERSIONS=y/# CONFIG_MODVERSIONS is not set/' $DEFCONFIG
-          grep -q 'CONFIG_MODVERSIONS' $DEFCONFIG || echo '# CONFIG_MODVERSIONS is not set' >> $DEFCONFIG
-          sed -i 's/^#ifdef CONFIG_MODVERSIONS$/#if 1 \/* forced: vendor DLKM vermagic needs "modversions" tag *\//' include/linux/vermagic.h
-          echo "=== modversions state ==="
-          grep 'CONFIG_MODVERSIONS' $DEFCONFIG
-          grep -n -B1 -A1 'MODULE_VERMAGIC_MODVERSIONS' include/linux/vermagic.h | head -8
+          # ---- vendor DLKM ABI 对齐 (WiFi / 音频不工作的真正原因) ----
+          # 实机 dmesg: 14 个 /vendor/lib/modules/*.ko 全部只报同一句
+          #   "disagrees about version of symbol module_layout"
+          # 没有任何其它符号报错 => ABI 差异只集中在 struct module 上。
+          # 从设备拖回 qca_cld3_wlan.ko / audio_wcd_core.ko 解析出的出厂真值:
+          #   vermagic              = 4.14.180-perf-gb24d113 SMP preempt mod_unload modversions aarch64
+          #   module_layout CRC     = 0x4ad0cd64
+          #   sizeof(struct module)= 0x380 (896)
+          # 具体差在: using_gplonly_symbols / BPF_EVENTS 两字段 / FUNCTION_ERROR_INJECTION,
+          # 以及 RELOCATABLE=n 把 ARM64_MODULE_PLTS 连带关掉, 少 40 字节的
+          # struct mod_arch_specific。全部处理逻辑见 scripts/abi-align-414180.sh。
+          #
+          # 注意: 绝不能再走"关 MODVERSIONS 强行放行"那条路(r7)。校验能绕过,
+          # 但成员偏移是错的, refcnt/exit 写坏内存 -> 开机几秒后重启循环。
+          bash ../this-repo/scripts/abi-align-414180.sh "$DEFCONFIG"
 
           # 不用 clang 的 LTO
           sed -i 's/^CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' $DEFCONFIG
@@ -307,6 +306,14 @@ jobs:
           for o in CONFIG_THREAD_INFO_IN_TASK CONFIG_UTS_NS CONFIG_PSI; do
             grep -q "^$o=y" out/.config || { echo "ERROR: $o != y, 出厂配置是 y"; exit 1; }
           done
+          # ABI 关键项: 任何一条不满足, /vendor/lib/modules 下的原厂 .ko 全废
+          for o in CONFIG_MODVERSIONS CONFIG_ARM64_MODULE_PLTS CONFIG_MODULE_UNLOAD CONFIG_PREEMPT CONFIG_SMP CONFIG_MODULES; do
+            grep -q "^$o=y" out/.config || { echo "ERROR: $o != y, struct module 布局会与出厂不一致"; exit 1; }
+          done
+          for o in CONFIG_BPF_EVENTS CONFIG_FUNCTION_ERROR_INJECTION CONFIG_CFI_CLANG; do
+            grep -q "^# $o is not set" out/.config || { echo "ERROR: $o 必须关闭, 否则 struct module 会多出成员"; exit 1; }
+          done
+          grep -q '^CONFIG_ARM64_MODULE_CMODEL_LARGE=y' out/.config || { echo "ERROR: CMODEL_LARGE 没跟着 PLTS 打开"; exit 1; }
           if grep -q '^CONFIG_RELOCATABLE=y' out/.config; then echo "ERROR: RELOCATABLE=y 但代码非 PIE"; exit 1; fi
 
           set +e
@@ -326,6 +333,10 @@ jobs:
             exit 1
           fi
           echo "vermagic compatible: $CAT"
+
+          # ABI 自检: 链接阶段就定了的事, 不要靠刷机去试
+          echo "=== ABI self-check (vmlinux __kcrctab vs 出厂 .ko) ==="
+          python3 ../this-repo/scripts/abi-verify.py out/vmlinux
 
       - name: Pack boot.img
         run: |
