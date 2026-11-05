@@ -30,7 +30,13 @@
 # =============================================================================
 set -euo pipefail
 
-DEFCONFIG="${1:?usage: abi-align-414180.sh <defconfig path relative to kernel/>}"
+DEFCONFIG="${1:?usage: abi-align-414180.sh <defconfig path relative to kernel/> [strict|permissive]}"
+MODE="${2:-strict}"
+case "$MODE" in
+  strict|permissive) ;;
+  *) echo "ERROR: MODE 只能是 strict 或 permissive, 收到 '$MODE'"; exit 1 ;;
+esac
+echo "### ABI 对齐模式: $MODE"
 
 echo "=== [ABI] 1/6 ARM64_MODULE_PLTS: 强制 default y (RELOCATABLE=n 时它会被关掉) ==="
 python3 - <<'PY'
@@ -72,6 +78,10 @@ for old, new, tag in edits:
     if new and new in s:
         print('already patched:', tag)
         continue
+    if not new and old not in s:
+        # 纯删除类改动 (old 不在 = 已经删过)
+        print('already patched:', tag)
+        continue
     if old not in s:
         raise SystemExit('ERROR: module.h 里找不到 %s 的定义片段' % tag)
     s = s.replace(old, new, 1)
@@ -81,7 +91,7 @@ assert 'using_gplonly_symbols' not in s
 assert s.count('#if 0 /* ABI: 4.14.180 的 struct module 没有这两个成员 */') == 2
 PY
 
-echo "=== [ABI] 3/6 kernel/module.c: 摘掉读写 + 放行 module_layout 的 CRC ==="
+echo "=== [ABI] 3/6 kernel/module.c: 摘掉已删字段的读写点 ==="
 python3 - <<'PY'
 import re
 p = 'kernel/module.c'
@@ -110,29 +120,6 @@ for pat, tag in (
         print('removed section_objs for', tag)
     else:
         print('already clean:', tag)
-
-# 4.14.357 把匿名 enum licence 改名成 enum mod_license/license, genksyms 对名字
-# 敏感, 即使布局一致 CRC 仍可能不同。布局已逐个成员核对一致, 只放行这一个符号;
-# 其余符号继续严格校验 —— 它们在设备上本来就全对。
-anchor = """	/* Exporting module didn't supply crcs?  OK, we're already tainted. */
-	if (!crc)
-		return 1;
-"""
-if 'ABI 对齐: module_layout' not in s:
-    add = """	/*
-	 * ABI 对齐: module_layout 的 CRC 是 genksyms 对 struct module 的摘要。
-	 * 我们已把 struct module 逐字段还原成出厂 4.14.180 的布局, 但本树把匿名
-	 * enum licence 改名成 enum mod_license / license, 文本差异仍会让 CRC 不同。
-	 * 布局已核对一致, 这一个符号直接放行; 其余符号严格校验。
-	 */
-	if (!strcmp(symname, "module_layout"))
-		return 1;
-
-"""
-    if anchor not in s:
-        raise SystemExit('ERROR: check_version() 里找不到锚点')
-    s = s.replace(anchor, add + anchor, 1)
-    print('patched check_version()')
 
 open(p, 'w').write(s)
 assert 'using_gplonly_symbols' not in s
@@ -184,32 +171,28 @@ else:
 assert 'mod->ei_funcs' not in s2
 PY
 
-echo "=== [ABI] 5/6 defconfig: 关掉 modversions, 但 vermagic 里必须保留标记 ==="
-# 为什么最终要关 MODVERSIONS:
-#   全表实测 518 个出厂符号, 只有 216 个 CRC 一致, 302 个不一致 —— 这不是
-#   struct module 的问题, 而是 4.14.180 -> 4.14.357 之间 struct sk_buff /
-#   cfg80211_* / notifier_block 等结构体在稳定版里增删过成员, genksyms 是
-#   递归摘要, 指针参数指向的结构体变一个字段, CRC 就变。硬凑 302 个 CRC 不现实。
+echo "=== [ABI] 5/6 defconfig: MODVERSIONS 策略 (MODE=$MODE) ==="
+# 两种模式, 用来做对照实验:
 #
-#   而 CRC 不一致真正致命的只有"按值传递的结构体", 内核 ABI 里几乎不存在;
-#   指针参数的调用约定与结构体内部布局无关。所以关掉校验是安全的。
+#   MODE=strict (默认, 安全)
+#     CONFIG_MODVERSIONS=y 保持原样。struct module 布局虽然已对齐, 但 302 个
+#     符号的 CRC 因 4.14.180 -> 4.14.357 的结构体漂移必然对不上, 其中就包括
+#     module_layout, 所以 vendor .ko 仍然会被拒之门外 —— 与 r6 的行为一致。
+#     内核本身干净, 用来证明"ABI 补丁没弄坏别的东西"。
 #
-#   r7 之所以关掉校验后重启循环, 不是"绕过校验"的错, 而是当时 struct module
-#   的成员偏移仍然是 4.14.357 的 —— 内核按新偏移写 refcnt/exit, 模块按旧偏移读,
-#   第一次 try_module_get 就写坏内存。现在偏移已被本脚本对齐, 校验关掉只是
-#   去掉一层文本摘要比对, 不再影响正确性。
-#
-#   关键副作用: vermagic 字符串必须仍然带 "modversions", 否则 vendor .ko 会报
-#   "version magic '... modversions aarch64' should be '... aarch64'" 而拒载。
-sed -i 's/^CONFIG_MODVERSIONS=y/# CONFIG_MODVERSIONS is not set/' "$DEFCONFIG"
-grep -q 'CONFIG_MODVERSIONS' "$DEFCONFIG" || echo '# CONFIG_MODVERSIONS is not set' >> "$DEFCONFIG"
+#   MODE=permissive (实验)
+#     CONFIG_MODVERSIONS=n + 强制 vermagic 保留 modversions 标记。
+#     check_version() 变成恒返回 1 的 stub, vendor .ko 会被放行。
+#     风险: 模块是按 4.14.180 的结构体布局编译的, 一旦它读写内核结构体内部的
+#     字段(而不是只传指针), 就会在 4.14.357 的内核上踩到偏移错位 -> oops。
 sed -i 's/^CONFIG_CFI_CLANG=y/# CONFIG_CFI_CLANG is not set/' "$DEFCONFIG"
 grep -q '^# CONFIG_CFI_CLANG is not set' "$DEFCONFIG" || echo '# CONFIG_CFI_CLANG is not set' >> "$DEFCONFIG"
-grep -E '^CONFIG_MODVERSIONS=|^# CONFIG_MODVERSIONS' "$DEFCONFIG"
-grep -E '^# CONFIG_CFI_CLANG is not set' "$DEFCONFIG" || true
 
-echo "--- vermagic: 强制保留 modversions 标记 ---"
-python3 - <<'PY'
+if [ "$MODE" = "permissive" ]; then
+  sed -i 's/^CONFIG_MODVERSIONS=y/# CONFIG_MODVERSIONS is not set/' "$DEFCONFIG"
+  grep -q 'CONFIG_MODVERSIONS' "$DEFCONFIG" || echo '# CONFIG_MODVERSIONS is not set' >> "$DEFCONFIG"
+  echo "--- vermagic: 强制保留 modversions 标记 (MODVERSIONS 关了但标记要留) ---"
+  python3 - <<'PY'
 p = 'include/linux/vermagic.h'
 s = open(p).read()
 if '#if 1 /* forced-vendor-dlkm */' in s:
@@ -222,7 +205,14 @@ else:
     open(p, 'w').write(s)
     print('patched: MODULE_VERMAGIC_MODVERSIONS 恒为 "modversions "')
 PY
-grep -n -A3 'MODULE_VERMAGIC_MODVERSIONS' include/linux/vermagic.h
+  grep -n -A2 'MODULE_VERMAGIC_MODVERSIONS' include/linux/vermagic.h
+else
+  sed -i 's/^# CONFIG_MODVERSIONS is not set/CONFIG_MODVERSIONS=y/' "$DEFCONFIG"
+  grep -q '^CONFIG_MODVERSIONS=y' "$DEFCONFIG" || echo 'CONFIG_MODVERSIONS=y' >> "$DEFCONFIG"
+  echo "MODVERSIONS=y (strict): vendor .ko 会被 CRC 校验挡掉, 内核行为同 r6"
+fi
+grep -E '^CONFIG_MODVERSIONS=|^# CONFIG_MODVERSIONS' "$DEFCONFIG"
+grep -E '^# CONFIG_CFI_CLANG is not set' "$DEFCONFIG" || true
 
 echo "=== [ABI] 6/6 kernel/module.c: 埋 sizeof/offset 探针 (构建后可直读) ==="
 # 关掉 MODVERSIONS 之后就没有 __crc_module_layout 可比了, 所以换一种不依赖
