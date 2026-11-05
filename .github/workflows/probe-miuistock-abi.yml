@@ -124,7 +124,7 @@ jobs:
           #  1) .bss.rtic 被摆在地址 0 附近 -> R_AARCH64_ADR_PREL_PG_HI21 溢出
           #  2) is_tp_doubleclick_enable 没有定义 -> CONFIG_..._DOUBLE_CLICK 没开
           # 详细推理见 scripts/fix-stock-tree.py 的文件头注释。
-          python3 this-repo/scripts/fix-stock-tree.py
+          python3 "$GITHUB_WORKSPACE/this-repo/scripts/fix-stock-tree.py"
           echo "=== 确认补丁生效 ==="
           grep -n "RTIC_BSS" arch/arm64/kernel/vmlinux.lds.S
           grep -n "__bss_stop" arch/arm64/kernel/vmlinux.lds.S
