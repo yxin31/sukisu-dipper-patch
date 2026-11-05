@@ -310,9 +310,16 @@ jobs:
           for o in CONFIG_MODVERSIONS CONFIG_ARM64_MODULE_PLTS CONFIG_MODULE_UNLOAD CONFIG_PREEMPT CONFIG_SMP CONFIG_MODULES; do
             grep -q "^$o=y" out/.config || { echo "ERROR: $o != y, struct module 布局会与出厂不一致"; exit 1; }
           done
-          for o in CONFIG_BPF_EVENTS CONFIG_FUNCTION_ERROR_INJECTION CONFIG_CFI_CLANG; do
-            grep -q "^# $o is not set" out/.config || { echo "ERROR: $o 必须关闭, 否则 struct module 会多出成员"; exit 1; }
-          done
+          # BPF_EVENTS (bool + default y) 和 FUNCTION_ERROR_INJECTION (def_bool y)
+          # 都是"无 prompt"的符号, defconfig 里写 not set 会被 olddefconfig 重算掉,
+          # 已改为在源码里摘字段 (scripts/abi-align-414180.sh 第 2~4 步)。
+          grep -q '^# CONFIG_CFI_CLANG is not set' out/.config || { echo "ERROR: CFI_CLANG 必须关闭"; exit 1; }
+          [ "$(grep -c 'ABI: 4.14.180 的 struct module 没有这两个成员' include/linux/module.h)" = "2" ] \
+            || { echo "ERROR: module.h 的 ABI 补丁不完整 (应有 2 处 #if 0)"; exit 1; }
+          grep -q 'ABI: struct module 无 bpf_raw_events' kernel/module.c \
+            || { echo "ERROR: module.c 的 bpf_raw_events 补丁没生效"; exit 1; }
+          grep -q 'ABI: struct module 无 ei_funcs' kernel/module.c \
+            || { echo "ERROR: module.c 的 ei_funcs 补丁没生效"; exit 1; }
           grep -q '^CONFIG_ARM64_MODULE_CMODEL_LARGE=y' out/.config || { echo "ERROR: CMODEL_LARGE 没跟着 PLTS 打开"; exit 1; }
           if grep -q '^CONFIG_RELOCATABLE=y' out/.config; then echo "ERROR: RELOCATABLE=y 但代码非 PIE"; exit 1; fi
 
