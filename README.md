@@ -349,3 +349,123 @@ KSU_VERSION = 30000 + git rev-list --count HEAD + 150
   KernelSU-Next 抢 manager 槽位，已卸载。
 - Manager 必须与内核版本同代：`v3.4.2(33355)` 配 33355 内核；`v1.1.1` 装上即自退，不可用。
 
+
+---
+
+## 2026-11-04 18:00 改用 SukiSU-Ultra（新流水线 `build-cepheus-sukisu.yml`）
+
+### 为什么要换
+
+内核本身能开机、SUSFS v2.3.0 也在，但 KernelSU-Next 的 **UAPI 协议代差**太严重：
+
+| | 内核侧（sidex15 legacy-susfs-v2） | Manager v3.4.2 |
+|---|---|---|
+| `struct ksu_get_info_cmd` | `version` / `flags` / `features` | 多一个 `uapi_version` |
+| `KERNEL_SU_UAPI_VERSION` | 无（读到 0） | 5 |
+| `KSU_APP_PROFILE_VER` | **3** | **4** |
+
+后果：首页红条 `Kernel update required`，而且授权 root 时传的是 v4 版
+`app_profile` 结构给 v3 版内核，字段错位。实测换成 **Manager v3.2.0 (33129)**
+后协议对齐（PROFILE_VER 3 / 无 uapi_version），`su` 立刻可用：
+
+```
+uid=0(root) gid=0(root) groups=0(root) context=u:r:ksu:s0
+su -v -> 3.2.0:KernelSU
+```
+
+### 换 SukiSU-Ultra 的关键结论（源码级确认）
+
+1. **SukiSU 走 syscall hook**，不认树里的 legacy 手动钩子。
+   树里 6 个文件的钩子全部包在
+   `#if defined(CONFIG_KSU) && !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)` 里：
+   `fs/exec.c`、`fs/open.c`、`fs/stat.c`、`fs/read_write.c`、`kernel/reboot.c`、
+   `drivers/input/input.c`。只要在顶层 `Makefile` **末尾**加
+   `KBUILD_CFLAGS += -DCONFIG_KSU_TAMPER_SYSCALL_TABLE`，6 个钩子全部自动关闭，
+   **内核源码一行都不用改**。
+   （必须加在末尾：`KBUILD_CFLAGS` 在 Makefile 前部被 `:=` 赋值，提前 `+=` 会被覆盖。）
+2. `CONFIG_KSU` 在 SukiSU 里 `depends on KPROBES && EXT4_FS`。少了 `KPROBES`
+   会被 Kconfig **静默丢弃**，内核里什么都没有，所以必须显式打开
+   `KPROBES` / `KALLSYMS` / `KALLSYMS_ALL`。
+3. **SUSFS 的 Kconfig 定义原本在 KernelSU-Next 的 `kernel/Kconfig` 里**，
+   换掉之后 `CONFIG_KSU_SUSFS` 变成未定义符号被 Kconfig 丢掉 →
+   `fs/Makefile` 的 `obj-$(CONFIG_KSU_SUSFS) += susfs.o` 失效 → SUSFS 全废。
+   修复：把 Kconfig 块落到 `cepheus/prebuilt/susfs-kconfig.txt`，
+   编译前 `cat` 进 `fs/Kconfig`。
+4. SukiSU 版本号同样按提交数算：`KSU_VERSION = 40000 + LOCAL_COUNT - 2815`。
+   Manager `v4.3.0-r1` = `41140` → 钉 `LOCAL_COUNT = 3955`。
+   （不钉的话它会去 curl GitHub API 数 commit，CI 里容易被限流，版本号乱跳。）
+
+### vendor DLKM 全部加载失败：真正的根因（2026-11-05 定位，推翻前一版结论）
+
+实机 `dmesg`（r6 镜像）：
+
+```
+27 次 "disagrees about version of symbol module_layout"
+14 个模块加载失败: wlan / wcd_core / swr / q6_pdr / tas2557 / tfa98xx /
+                  cs35l41 / wcd_spi / pinctrl_wcd / stub / exfat /
+                  rmnet_perf / hdmi / wglink
+```
+
+表现：`wlan0` 不存在（WiFi 完全没起来）、音频 codec 不加载。
+
+**关键观察：27 条错误全部是 `module_layout`，没有任何一个其它符号报错。**
+
+这说明导出符号的 ABI 基本是好的，差异只集中在 `struct module` 这一个结构体上。
+因为 `module_layout` 这个"符号"并不是函数，它的 CRC 是 genksyms 对
+`struct module` 定义的摘要 —— 结构体多一个成员，CRC 就变。
+
+#### 用原厂 `.ko` 拿到真值
+
+从设备把 `qca_cld3_wlan.ko` / `audio_wcd_core.ko` 拖回来直接解析 ELF
+（`__versions` 段 + `.modinfo` + `.gnu.linkonce.this_module` 段大小）：
+
+```
+vermagic              = 4.14.180-perf-gb24d113 SMP preempt mod_unload modversions aarch64
+module_layout CRC     = 0x4ad0cd64
+sizeof(struct module) = 0x380 (896 字节)
+```
+
+#### 逐行 diff `include/linux/module.h`（4.14.180 vs 4.14.357）
+
+`struct module` 多出 4 处成员：
+
+| # | 差异 | 处理 |
+|---|---|---|
+| 1 | `#ifdef CONFIG_CFI_CLANG` 的 `cfi_check` | 用 gcc，本来就不存在 |
+| 2 | `bool using_gplonly_symbols;`（**没有任何 ifdef**） | 删掉字段（连同 2 处读写） |
+| 3 | `#ifdef CONFIG_BPF_EVENTS` 的两个字段 | 该符号是 `bool` + `default y`，**没有 prompt**，defconfig 写 `not set` 会被 `olddefconfig` 重算回 `y`。只能在源码里 `#if 0` 摘掉，并清掉 `module.c` / `bpf_trace.c` 各处引用 |
+| 4 | `#ifdef CONFIG_FUNCTION_ERROR_INJECTION` 的两个字段 | 同上，`def_bool y`（依赖 `KPROBES`，而 KSU 必须开 `KPROBES`，所以必然为 y）。摘字段 + 把 `lib/error-inject.c` 的两个入口变成空实现 |
+
+还有一处更隐蔽的：`RELOCATABLE=n`（为了绕开 PIE 的 dangerous relocation）
+会让 `ARCH_HAS_RELR` 连带失效，进而 `ARM64_MODULE_PLTS` 被关，于是
+`struct mod_arch_specific` 少了 3 个成员（40 字节），把 `arch` 之后的
+`taints` / `kallsyms` / `source_list` / `target_list` / `exit` / `refcnt`
+**全部顶偏**。修复是在 `arch/arm64/Kconfig` 给 `ARM64_MODULE_PLTS` 加
+`default y`（这个系列里它没有 `depends on RELOCATABLE`，所以可以单独打开）。
+
+#### 为什么"关掉 MODVERSIONS"是错的（r7 的教训）
+
+`# CONFIG_MODVERSIONS is not set` 可以让 `check_version()` 直接放行，模块确实装进去了，
+但**成员偏移依然是错的**。内核按 357 的偏移去写 `refcnt` / `exit`，模块按 180 的
+偏移去读，第一次 `try_module_get()` 就写坏内存 —— 实机表现就是
+"开机几秒后重启循环"。所以校验只能被"满足"，不能被"绕过"。
+
+#### 现在的做法 + 构建后自检
+
+- `scripts/abi-align-414180.sh`：把上面 4 处差异 + PLTS 全部对齐，
+  `CONFIG_MODVERSIONS` 保持 `=y`。
+- `scripts/abi-verify.py`：**链接完 vmlinux 立刻读 `__kcrctab`**，把内核算出的
+  `__crc_module_layout` 跟 `0x4ad0cd64` 比对，不一致直接让 CI 失败。
+  这样"ABI 对不对"不再需要刷一次机才知道。
+- `kernel/module.c` 的 `check_version()` 只对 `module_layout` 一个符号放行
+  （本树把匿名 `enum licence` 改名成 `enum mod_license`/`license`，genksyms
+  对文本敏感，CRC 可能仍不同；布局已逐个成员核对一致，故只放行这一个）。
+  其余符号继续严格校验 —— 它们本来就全对。
+
+### 两条流水线
+
+| 文件 | root 框架 | 状态 |
+|---|---|---|
+| `.github/workflows/build-cepheus-miuikernel.yml` | KernelSU-Next + Manager v3.2.0 | 可用（实测 root 已通） |
+| `.github/workflows/build-cepheus-sukisu.yml` | SukiSU-Ultra v4.3.0-r1 | 不可用：main 分支不兼容 4.14（SELinux 内部结构全是 5.x+） |
+
