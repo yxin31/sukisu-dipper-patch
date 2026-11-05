@@ -46,6 +46,11 @@ if [ "$ACTION" = "rollback" ]; then
     cp -f "$f" "$DEST/$b" && { chmod 0644 "$DEST/$b"; n=$((n+1)); say "还原 $b"; }
   done
   [ "$n" -gt 0 ] || die "备份目录是空的"
+  # 还原被禁用的内建替代品 (cnss_utils.ko.disabled -> cnss_utils.ko)
+  for f in "$DEST"/*.ko.disabled; do
+    [ -f "$f" ] || continue
+    mv -f "$f" "${f%.disabled}" && { say "恢复 $(basename "${f%.disabled}")"; n=$((n+1)); }
+  done
   say "还原了 $n 个, sync 后 reboot"
   sync
   exit 0
@@ -125,14 +130,14 @@ for n in $OK; do
   say "替换 $n"
 done
 
-# ---- 5. cnss_utils 已内建进内核, 原厂那个模块留着只会加载失败 ----
-if [ -f "$DEST/cnss_utils.ko" ] && ! ls "$SRC"/cnss_utils.ko >/dev/null 2>&1; then
-  if [ ! -f "$BAK/cnss_utils.ko" ]; then
-    cp -p "$DEST/cnss_utils.ko" "$BAK/cnss_utils.ko"
+# ---- 5. cnss_utils / cnss_prealloc 已内建进内核, 原厂那两个模块留着只会冲突 ----
+for m in cnss_utils cnss_prealloc; do
+  if [ -f "$DEST/$m.ko" ] && [ ! -f "$SRC/$m.ko" ]; then
+    [ -f "$BAK/$m.ko" ] || cp -p "$DEST/$m.ko" "$BAK/$m.ko"
+    mv -f "$DEST/$m.ko" "$DEST/$m.ko.disabled" 2>/dev/null && \
+      say "禁用原厂 $m.ko (本内核已内建同名功能)"
   fi
-  mv -f "$DEST/cnss_utils.ko" "$DEST/cnss_utils.ko.disabled" 2>/dev/null && \
-    say "禁用原厂 cnss_utils.ko (本内核已内建同名功能)"
-fi
+done
 
 sync
 say "已替换:$REPLACED"
