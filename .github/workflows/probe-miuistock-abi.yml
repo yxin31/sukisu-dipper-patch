@@ -1,0 +1,157 @@
+name: Probe MIUI stock kernel ABI (cepheus, 4.14.190 tree)
+
+# 目的: 只回答一个问题 —— 用 lelaonn/Cepheus_Raphael_Kernel_MI_A11 这棵树
+# 编出来的内核, 其导出符号的 CRC 能不能跟设备上原厂 vendor .ko 的 518 条对上。
+#
+# 为什么是这棵树:
+#   MiCode 的 cepheus-q-oss 是 4.14.117 (Android 10), 不能用;
+#   Xirudly 的 16-ksun_susfs 是 4.14.357, 与出厂 4.14.180 之间隔了 177 个
+#   stable 版本, struct sk_buff / cfg80211_* 等一批结构体都漂移了,
+#   实测 518 条里 302 条 CRC 不一致 —— 这就是 WiFi/音频起不来的根因。
+#   lelaonn/Cepheus_Raphael_Kernel_MI_A11 标注 "Stock Kernel for MI 9 and
+#   Mi 9T PRO for MIUI Android 11", 它的 arch/arm64/configs/cepheus_stock_defconfig
+#   与从本机内核 IKCONFIG 提取的出厂配置逐条比对: 5095 条, 0 差异。
+#   也就是说这就是出货树的镜像, 只是 Makefile 的 SUBLEVEL 写着 190。
+#
+# 注意: 这个 workflow 不打 KernelSU, 只编原始内核拿 vmlinux 做 ABI 判定。
+#       ABI 通了才值得投入去打 KSU 补丁。
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "内核仓库"
+        required: false
+        default: "lelaonn/Cepheus_Raphael_Kernel_MI_A11"
+      kernel_ref:
+        description: "分支"
+        required: false
+        default: "master"
+      spoof_sublevel:
+        description: "把 SUBLEVEL 改成 180 (仅影响 vermagic, 不影响 CRC)"
+        type: boolean
+        default: true
+
+env:
+  EXPECTED_VERMAGIC: "4.14.180-perf-gb24d113 SMP preempt mod_unload modversions aarch64"
+
+jobs:
+  probe:
+    name: Build stock tree and compare CRC
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Set env
+        run: |
+          echo "KREPO=${{ inputs.kernel_repo || 'lelaonn/Cepheus_Raphael_Kernel_MI_A11' }}" >> $GITHUB_ENV
+          echo "KREF=${{ inputs.kernel_ref || 'master' }}" >> $GITHUB_ENV
+          echo "SPOOF=${{ inputs.spoof_sublevel }}" >> $GITHUB_ENV
+
+      - name: Install packages
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            cpio kmod rsync python3 zip
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth 1 --branch "$KREF" "https://github.com/$KREPO.git" kernel
+          cd kernel
+          echo "=== 版本 ==="
+          sed -n '1,6p' Makefile
+
+      - name: Checkout this repo (scripts)
+        uses: actions/checkout@v4
+        with:
+          path: this-repo
+
+      - name: Sanity check defconfig matches factory
+        working-directory: kernel
+        run: |
+          ls -l arch/arm64/configs/cepheus_stock_defconfig
+          grep -cE '^(CONFIG_|# CONFIG_)' arch/arm64/configs/cepheus_stock_defconfig
+          for o in CONFIG_MODVERSIONS CONFIG_ARM64_MODULE_PLTS CONFIG_PREEMPT CONFIG_SMP CONFIG_MODULES; do
+            grep -q "^$o=y" arch/arm64/configs/cepheus_stock_defconfig \
+              && echo "  ok  $o=y" \
+              || { echo "  MISSING $o=y"; exit 1; }
+          done
+
+      - name: Spoof version string
+        working-directory: kernel
+        run: |
+          if [ "$SPOOF" = "true" ]; then
+            sed -i 's/^SUBLEVEL = .*/SUBLEVEL = 180/' Makefile
+            sed -i 's/^EXTRAVERSION =.*/EXTRAVERSION = -perf-gb24d113/' Makefile
+          fi
+          # 删掉 .git, 否则 scripts/setlocalversion 会追加 -g<sha>, vermagic 就对不上
+          rm -rf .git
+          echo "=== 伪造后的版本 ==="
+          sed -n '1,6p' Makefile
+          grep -n '^LOCALVERSION' Makefile || true
+
+      - name: Patch for GCC 11 (4.14 era code)
+        working-directory: kernel
+        run: |
+          # -Werror 在老代码 + 新编译器下几乎必然踩坑
+          for f in Makefile scripts/Makefile.build; do
+            [ -f "$f" ] || continue
+            sed -i 's/-Werror=/-Wno-error=/g' "$f"
+            sed -i 's/-Werror\([^a-zA-Z=-]\)/-Wno-error\1/g' "$f"
+            sed -i 's/-Werror$/-Wno-error/g' "$f"
+          done
+          # 小米内核自带的 gcc-wrapper.py 是 Python2 语法
+          if [ -f scripts/gcc-wrapper.py ]; then
+            printf '%s\n' '#!/usr/bin/env python3' 'import subprocess, sys' \
+              'sys.exit(subprocess.call(sys.argv[1:]))' > scripts/gcc-wrapper.py
+            chmod +x scripts/gcc-wrapper.py
+            echo "gcc-wrapper.py replaced"
+          fi
+          # 关掉编译期 object-size 检查 (只影响编译, 不影响运行时)
+          if [ -f include/linux/compiler-gcc.h ]; then
+            sed -i 's/__compiletime_object_size(obj) __builtin_object_size(obj, 0)/__compiletime_object_size(obj) (-1)/' \
+              include/linux/compiler-gcc.h
+          fi
+          # verbose 编译期数组越界检查会让老代码大批报错
+          sed -i 's/^CONFIG_CC_OPTIMIZE_FOR_SIZE=y/# CONFIG_CC_OPTIMIZE_FOR_SIZE is not set/' arch/arm64/configs/cepheus_stock_defconfig || true
+
+      - name: Configure
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          make ARCH=arm64 cepheus_stock_defconfig 2>&1 | tail -10
+          echo "=== 关键配置 ==="
+          grep -E '^CONFIG_(MODVERSIONS|ARM64_MODULE_PLTS|PREEMPT|SMP|MODULES|LOCALVERSION_AUTO|LOCALVERSION)=' .config || true
+          grep -E '^# CONFIG_MODVERSIONS' .config || true
+          echo "=== KERNELRELEASE ==="
+          make -s ARCH=arm64 kernelrelease
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          make -j$(nproc) ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            HOSTCC=gcc HOSTCFLAGS=-fcommon \
+            Image -k 2>&1 | tail -80
+          echo "=== 产物 ==="
+          ls -lh vmlinux arch/arm64/boot/Image 2>&1
+
+      - name: ABI report (518 CRC vs factory)
+        run: |
+          python3 this-repo/scripts/crc-report.py kernel/vmlinux --strict || true
+          echo "---- 复查 exit code ----"
+          python3 this-repo/scripts/crc-report.py kernel/vmlinux --strict
+
+      - name: vermagic check
+        working-directory: kernel
+        run: |
+          echo "=== 编出来的 vermagic ==="
+          if [ -f include/generated/utsrelease.h ]; then
+            cat include/generated/utsrelease.h
+          fi
+          strings vmlinux 2>/dev/null | grep -m5 -E '^4\.14\.[0-9]+.*(SMP|modversions)' || true
+          echo "期望: $EXPECTED_VERMAGIC"
