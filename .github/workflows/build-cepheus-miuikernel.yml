@@ -307,9 +307,17 @@ jobs:
             grep -q "^$o=y" out/.config || { echo "ERROR: $o != y, 出厂配置是 y"; exit 1; }
           done
           # ABI 关键项: 任何一条不满足, /vendor/lib/modules 下的原厂 .ko 全废
-          for o in CONFIG_MODVERSIONS CONFIG_ARM64_MODULE_PLTS CONFIG_MODULE_UNLOAD CONFIG_PREEMPT CONFIG_SMP CONFIG_MODULES; do
+          for o in CONFIG_ARM64_MODULE_PLTS CONFIG_MODULE_UNLOAD CONFIG_PREEMPT CONFIG_SMP CONFIG_MODULES; do
             grep -q "^$o=y" out/.config || { echo "ERROR: $o != y, struct module 布局会与出厂不一致"; exit 1; }
           done
+          # MODVERSIONS 必须是 n: 出厂 518 个符号里 302 个 CRC 因 4.14.180->357 的
+          # 结构体漂移天然不一致, 校验开着就永远加载不了 vendor 模块。
+          grep -q '^# CONFIG_MODVERSIONS is not set' out/.config \
+            || { echo "ERROR: MODVERSIONS 必须关闭"; exit 1; }
+          grep -q 'forced-vendor-dlkm' include/linux/vermagic.h \
+            || { echo "ERROR: vermagic.h 的 modversions 标记没强制打开, vendor .ko 会拒载"; exit 1; }
+          grep -q '__ksu_abi_sizeof_module' kernel/module.c \
+            || { echo "ERROR: struct module 探针没埋上"; exit 1; }
           # BPF_EVENTS (bool + default y) 和 FUNCTION_ERROR_INJECTION (def_bool y)
           # 都是"无 prompt"的符号, defconfig 里写 not set 会被 olddefconfig 重算掉,
           # 已改为在源码里摘字段 (scripts/abi-align-414180.sh 第 2~4 步)。
