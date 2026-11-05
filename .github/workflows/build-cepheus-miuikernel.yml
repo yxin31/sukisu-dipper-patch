@@ -217,14 +217,23 @@ jobs:
           # 编译里完成 —— 事后改 .config 会让 autoconf.h 变脏, 整个树重编一遍。
           # 这些都是 =m, 不进 Image, 对内核本体和 ABI 零影响。
           if [ "$build_vendor_mods" = "true" ]; then
-            add_cfg() { sed -i "/^${1%%=*}=/d" $DEFCONFIG; echo "$1" >> $DEFCONFIG; }
+            add_cfg() {
+              local k
+              k=$(printf '%s' "$1" | sed 's/^#* *//; s/[= ].*//')
+              sed -i "/^${k}=/d; /^# ${k} is not set$/d" $DEFCONFIG
+              printf '%s\n' "$1" >> $DEFCONFIG
+            }
             add_cfg 'CONFIG_CNSS2=m'
             add_cfg 'CONFIG_CNSS2_QMI=y'
             add_cfg 'CONFIG_CNSS_UTILS=m'
             add_cfg 'CONFIG_CNSS_PREALLOC=m'
             add_cfg 'CONFIG_QCA_CLD_WLAN=m'
+            # DVB_MPQ_DEMUX 是出厂 defconfig 里遗留的 =m, 它引用的
+            # ion_alloc_dmabuf 在 ION 没开任何 heap 时不存在, modpost 会直接
+            # 整体失败 -> 一个 .ko 都不生成。cepheus 上没有 DVB 硬件, 关掉。
+            add_cfg '# CONFIG_DVB_MPQ is not set'
             echo "=== vendor DLKM config 已写入 defconfig ==="
-            grep -E '^CONFIG_(CNSS|QCA_CLD_WLAN)' $DEFCONFIG || true
+            grep -E '^CONFIG_(CNSS|QCA_CLD_WLAN)|^# CONFIG_DVB_MPQ is not set' $DEFCONFIG || true
           else
             echo "### build_vendor_mods=false: 不编 wifi 模块"
           fi
@@ -456,7 +465,9 @@ jobs:
                  out/drivers/net/wireless/cnss2/*.ko 2>/dev/null || true
 
           test -f out/drivers/staging/qcacld-3.0/wlan.ko \
-            || { echo "ERROR: wlan.ko 没编出来"; grep -nE 'error:|Error [0-9]' modules.log | tail -30; exit 1; }
+            || { echo "ERROR: wlan.ko 没编出来"
+                 grep -nE 'error:|Error [0-9]|ERROR:' modules.log | tail -40
+                 exit 1; }
           echo "wlan.ko OK"
 
       - name: Package vendor modules
