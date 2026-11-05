@@ -132,11 +132,29 @@ jobs:
         working-directory: kernel
         run: |
           set +e
+          # TRACE_INCLUDE_PATH 展开成 "./hid-trace.h" 这种相对路径, define_trace.h
+          # 里的 #include 会以 include/trace/ 为基准去找, 必须把各目录塞进 -I。
+          # 不手写清单: 直接扫出所有含 *trace.h 的目录, 另外补已知缺头文件的目录。
+          INC_FLAGS=""
+          add_inc() {
+            [ -d "$1" ] || return 0
+            case " $INC_FLAGS " in *" -I$(pwd)/$1 "*) return 0;; esac
+            INC_FLAGS="$INC_FLAGS -I$(pwd)/$1"
+          }
+          while read -r d; do add_inc "$d"; done < <(
+            find drivers techpack -name '*-trace.h' -printf '%h\n' 2>/dev/null | sort -u
+          )
+          for d in drivers/hid drivers/power/supply/qcom \
+                   drivers/media/platform/msm/camera/cam_utils \
+                   techpack/audio/asoc techpack/display/msm; do
+            add_inc "$d"
+          done
+          echo "extra inc dirs: $(printf '%s' "$INC_FLAGS" | wc -w)"
           make -j$(nproc) ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             HOSTCC=gcc HOSTCFLAGS=-fcommon \
-            KCFLAGS="-fcommon -Wno-error -Wno-array-bounds -Wno-maybe-uninitialized" \
+            KCFLAGS="$INC_FLAGS -fcommon -Wno-error -Wno-array-bounds -Wno-maybe-uninitialized" \
             Image -k > build.log 2>&1
           RC=$?
           echo "make exit code = $RC"
@@ -148,7 +166,10 @@ jobs:
           tail -40 build.log
           echo "=== 产物 ==="
           ls -lh vmlinux arch/arm64/boot/Image 2>&1
-          echo "BUILD_RC=$RC" >> $GITHUB_ENV
+          if [ ! -f vmlinux ]; then
+            echo "##[error] 没有产出 vmlinux, 编译失败"
+            exit 1
+          fi
 
       - name: Upload build log
         if: always()
