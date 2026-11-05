@@ -469,3 +469,146 @@ sizeof(struct module) = 0x380 (896 字节)
 | `.github/workflows/build-cepheus-miuikernel.yml` | KernelSU-Next + Manager v3.2.0 | 可用（实测 root 已通） |
 | `.github/workflows/build-cepheus-sukisu.yml` | SukiSU-Ultra v4.3.0-r1 | 不可用：main 分支不兼容 4.14（SELinux 内部结构全是 5.x+） |
 
+
+---
+
+## 2026-11-05 05:30 把 vendor DLKM 这件事查到底：518 条符号全表实测
+
+上一轮只盯着 `module_layout` 一个符号，那是被 `check_version()` 的短路行为骗了。
+`kernel/module.c` 是**按 `____versions` 顺序逐符号校验、第一个不匹配就直接返回 NULL**，
+所以设备上永远只会看到第一条报错，后面的差异全被挡住。
+
+### 做法：把出厂真值整张表扒下来
+
+从设备 `/vendor/lib/modules` 拖回两个原厂模块，解析 `__versions` 段：
+
+| 模块 | 条目数 | 其中与本仓库无关的 |
+|---|---|---|
+| `qca_cld3_wlan.ko` | 429 | — |
+| `audio_wcd_core.ko` | 131 | — |
+| 合并去重 | **518** | 两个模块对同一符号的 CRC 完全一致，可互相印证 |
+
+表落在 `scripts/stock-versions.txt`（`<crc> <符号名>`，518 行），
+`scripts/abi-verify.py` 构建完直接读 `vmlinux` 的 `__crc_*` 全表比对。
+
+### 结果：216 一致 / 302 不一致
+
+不是布局没修好，是**稳定版 4.14.180 → 4.14.357 之间的结构体漂移**：
+
+- genksyms 是**递归摘要** —— 指针参数指向的结构体多一个字段，函数的 CRC 就变；
+- `struct sk_buff`、`cfg80211_*`、`struct notifier_block`、`struct cdev` 这些
+  在 177 个稳定版迭代里都动过，于是 `__alloc_skb`、`cfg80211_get_bss`、
+  `blocking_notifier_call_chain`、`cdev_add` 一片全变；
+- 而 `__kmalloc(size_t, gfp_t)` 这种只有标量参数的，CRC 一模一样 ——
+  这恰好反证了"读取方法是对的，差异是真实的源码差异"。
+
+想靠改源码把 302 个 CRC 凑成原样，等于把内核回退到 4.14.180，不现实。
+
+### 所以改了策略：不凑 CRC，改证"布局"
+
+CRC 不一致真正致命的只有**按值传递的结构体**——内核 ABI 里几乎没有；
+指针参数的调用约定与结构体内部布局无关。唯一被内核**直接写入模块镜像**的
+结构体就是 `struct module`。所以判定标准从"CRC 相等"换成"布局相等"：
+
+1. `scripts/abi-align-414180.sh` 第 6 步在 `kernel/module.c` 末尾埋 3 个探针数组：
+   ```c
+   char __ksu_abi_sizeof_module[sizeof(struct module)] __used;
+   char __ksu_abi_off_module_init[__builtin_offsetof(struct module, init)] __used;
+   char __ksu_abi_off_module_exit[__builtin_offsetof(struct module, exit)] __used;
+   ```
+   数组长度由编译器算，落在 `vmlinux` 的 `.bss` 里，符号的 `st_size` 就是测量值。
+2. 真值从原厂 `.ko` 的 `.gnu.linkonce.this_module` 段的**重定位表**里读：
+   ```
+   size = 0x380 (896)
+   .init  重定位 @ 0x150 (336)
+   .exit  重定位 @ 0x310 (784)   <- 指向 cleanup_module
+   ```
+3. `CONFIG_MODVERSIONS=n`（`module_layout` 并不是 .ko 的 undefined 符号，
+   只存在于 `__versions` 元数据里，关掉不会 `Unknown symbol`），
+   同时把 `include/linux/vermagic.h` 的 `#ifdef CONFIG_MODVERSIONS` 硬改成 `#if 1`，
+   保证 vermagic 仍是 `... mod_unload modversions aarch64`，否则会变成
+   `version magic '... modversions aarch64' should be '... aarch64'` 被拒载。
+
+只有这三项探针全部吻合，CI 才放行打包 —— 不吻合就打印差了多少字节、对应哪个字段，
+不用刷机。
+
+### 这轮踩到的两个 CI 坑（都记在这，避免重复）
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `ERROR: CFI_CLANG 必须关闭` | 用 gcc 时 `CONFIG_CFI_CLANG` 在 `arch/arm64/Kconfig` 里被 `CC_IS_CLANG` 屏蔽，`.config` 里**根本没有这行**（既不是 `=y` 也不是注释行） | 断言改成"不能是 `=y`" |
+| `ABI-CHECK` 三个符号全 `MISMATCH`，段名显示 `.text` | 第一版脚本找的是 `printk` 这个符号而不是 `__crc_printk`，读到的是函数第一条指令（`0xd10283ff` 这种 arm64 机器码） | 加 `__crc_` 前缀；`__kmalloc` 随后对上，反证读法正确 |
+
+---
+
+## 2026-11-05 15:00 放弃对齐 ABI，改成"用同一棵树重编 vendor 模块"
+
+### 换源码树这条路已经走死
+
+| 源码树 | 与设备 518 条 CRC 一致 |
+|---|---|
+| 4.14.357（`Xirudly/kernel_xiaomi_cepheus@16-ksun_susfs`，r6/r13 用的） | 216 / 518（41.7%） |
+| 4.14.190（`lelaonn/Cepheus_Raphael_Kernel_MI_A11`，"MIUI A11 出厂树"） | 229 / 518（44.21%） |
+
+最硬的一条证据是 `__stack_chk_fail`。原型 `void __stack_chk_fail(void)`，**无参数**，
+所以它的 CRC 在所有内核世代都是固定值 `0xf0fdf6cb`（拿 RHEL7 的 RPM 依赖串、
+6.11 的 `jbd2.mod.c` 两处独立核对过）。而 lelaonn 这棵树编出来是 `0xdb7305a1`。
+**连无参函数都算不对，说明那棵树不是出货源码，而是被改动拼合过的。**
+
+旁证：它让 `dsi_panel.c` 无条件调 `is_tp_doubleclick_enable()`，而出厂 `.config`
+里压根没有 `CONFIG_TOUCHSCREEN_MI_DAVINCI_DOUBLE_CLICK` 这一项 —— 代码是后来加的，
+作者忘了补 Kconfig，于是链接期 undefined。
+
+另外 MiCode 全部 267 个分支里 `-r-oss`（Android 11）有 37 个，**没有 cepheus，
+也没有任何 sm8150**，只有 `-p-oss`(A9) 和 `-q-oss`(A10, 4.14.117)。
+"去找真正的出厂树"没有候选，这条路关闭。
+
+### 新策略：内核用我们的，模块也用我们的
+
+`/vendor/lib/modules` 下的 `.ko` 是按 4.14.180 的布局编的，跟本树结构体有漂移，
+`check_version()` 直接拒 -> 没 WiFi。既然源码树里 WLAN 栈是**完整的**
+（`drivers/staging/qcacld-3.0` + `qca-wifi-host-cmn` + `drivers/staging/fw-api`
++ `drivers/net/wireless/cnss*`），那就用同一棵树把它编出来，模块与内核同源，
+结构体天然对齐，ABI 问题绕开。
+
+关键点：**`abi_mode` 继续用 `strict`**（保持 `CONFIG_MODVERSIONS=y`）。
+这样原厂的错位模块会被拒载（不崩，只是功能缺失），而我们同源编的模块 CRC 天然一致、
+能正常加载。要是关掉 MODVERSIONS（permissive），原厂模块全放进来，就是 r13 的
+重启循环。
+
+### 编译这一套踩到的 4 个坑
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `cnss_utils.ko` 编不出来，配置"写了"却没生效 | `CONFIG_CNSS_UTILS` 的 Kconfig 是 **bool**（`drivers/net/wireless/cnss_utils/Kconfig`），写 `=m` 被 kconfig 判非法后静默丢弃 | 改 `=y`，内建进 vmlinux（顺带消掉原厂 `cnss_utils.ko` 的 ABI 风险，install.sh 会把它改名禁用） |
+| `cnss_prealloc.ko` 编不出来 | 符号名根本不是 `CONFIG_CNSS_PREALLOC`，正确是 **`CONFIG_WCNSS_MEM_PRE_ALLOC`**（tristate，在 `drivers/net/wireless/Kconfig:117`） | 改对符号名 |
+| `modpost` 整体失败，**一个 `.ko` 都不生成** | `CONFIG_DVB_MPQ=m` 是出厂 defconfig 遗留（cepheus 没有 DVB 硬件），它引用的 `ion_alloc_dmabuf` 在 `CONFIG_ION=y` 但没开任何 heap 时不存在。`modpost` 是全模块统一的，一个错全灭 | defconfig 加 `# CONFIG_DVB_MPQ is not set` |
+| `wlan.ko` 336MB，推不进手机 | 树里开了 `CONFIG_DEBUG_INFO` | `aarch64-linux-gnu-strip --strip-debug`（只删调试段，`.modinfo`/`__versions`/`.symtab` 全保留），打包前断言 < 63MB |
+
+### 设备端流程
+
+```
+fastboot flash boot boot.img          # 内核 + KSU + SUSFS
+# 首次开机 wifi 大概率仍不可用, 这是预期: 模块还是出厂的
+adb push vendor-modules.tar.gz /data/local/tmp/
+adb shell su -c 'mkdir -p /data/local/tmp/vm && \
+  tar -xzf /data/local/tmp/vendor-modules.tar.gz -C /data/local/tmp/vm && \
+  sh /data/local/tmp/vm/install.sh check'      # 先只读检查
+adb shell su -c 'sh /data/local/tmp/vm/install.sh'   # 再替换
+adb reboot
+```
+
+`install.sh` 会逐个把 `.ko` 的 `vermagic` 跟 `uname -r` **逐字符比对**，
+不一致的直接 skip，不会把错的推进去。原厂 `.ko` 备份在
+`/data/local/tmp/vendor-modules-backup`，`install.sh rollback` 可还原。
+
+`diag-vendor-modules.sh` 是纯只读诊断，用来确认模块加载时序、哪个 `.ko` 报
+`disagrees about version`、内核里 `cnss_utils` 是否已内建。
+
+### 音频
+
+这棵树 `techpack/audio` 是静态变体（`sm8150auto.conf` 全 `=y`，
+`drivers-y := … techpack/` 直接链进 vmlinux），音频驱动本来就在内核里，
+不依赖外挂 DLKM。如果刷完仍没声音，先看设备上是不是还有
+`audio_wcd_core.ko` 之类的原厂模块被 insmod —— 那会被 CRC 拒（不崩），
+但内核内建的那份应该已经接管。
