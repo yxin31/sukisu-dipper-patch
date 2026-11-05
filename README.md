@@ -581,7 +581,7 @@ CRC 不一致真正致命的只有**按值传递的结构体**——内核 ABI �
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `cnss_utils.ko` 编不出来，配置"写了"却没生效 | `CONFIG_CNSS_UTILS` 的 Kconfig 是 **bool**（`drivers/net/wireless/cnss_utils/Kconfig`），写 `=m` 被 kconfig 判非法后静默丢弃 | 改 `=y`，内建进 vmlinux（顺带消掉原厂 `cnss_utils.ko` 的 ABI 风险，install.sh 会把它改名禁用） |
-| `cnss_prealloc.ko` 编不出来 | 符号名根本不是 `CONFIG_CNSS_PREALLOC`，正确是 **`CONFIG_WCNSS_MEM_PRE_ALLOC`**（tristate，在 `drivers/net/wireless/Kconfig:117`） | 改对符号名 |
+| `cnss_prealloc.ko` 编不出来，换成 `-DMODULE` 直接编译报错 | 两层原因：① 符号名不是 `CONFIG_CNSS_PREALLOC`，正确是 **`CONFIG_WCNSS_MEM_PRE_ALLOC`**（`drivers/net/wireless/Kconfig:117`）；② 更要紧的是 `cnss_prealloc.c:387` 写了 `MODULE_DESCRIPTION(DEVICE "WCNSS Prealloc Driver")`，而 **`DEVICE` 宏全树没有定义**。内建时 `MODULE_DESCRIPTION` 展开成空所以不报错（出厂 defconfig 本来就是 `=y`），一旦 `-DMODULE` 就变成 `MODULE_INFO(description, DEVICE ...)` → `expected ',' or ';' before 'DEVICE'`，而它在 `drivers/net/wireless` 下、排在 `drivers/staging` 之前，`make -k` 也救不回 wlan.ko | 保持 `CONFIG_WCNSS_MEM_PRE_ALLOC=y` 内建，不编这个模块 |
 | `modpost` 整体失败，**一个 `.ko` 都不生成** | `CONFIG_DVB_MPQ=m` 是出厂 defconfig 遗留（cepheus 没有 DVB 硬件），它引用的 `ion_alloc_dmabuf` 在 `CONFIG_ION=y` 但没开任何 heap 时不存在。`modpost` 是全模块统一的，一个错全灭 | defconfig 加 `# CONFIG_DVB_MPQ is not set` |
 | `wlan.ko` 336MB，推不进手机 | 树里开了 `CONFIG_DEBUG_INFO` | `aarch64-linux-gnu-strip --strip-debug`（只删调试段，`.modinfo`/`__versions`/`.symtab` 全保留），打包前断言 < 63MB |
 
