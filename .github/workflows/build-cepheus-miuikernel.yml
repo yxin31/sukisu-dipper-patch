@@ -21,6 +21,8 @@ env:
   defconfig: cepheus_stock_defconfig
   stock_kernel_sublevel: 180
   stock_localversion: "-perf-gb24d113"
+  # 是否顺带把 vendor 的 wifi 模块 (qca_cld3_wlan.ko / cnss2.ko) 用同一棵树编出来
+  build_vendor_mods: "true"
 
 on:
   workflow_dispatch:
@@ -38,6 +40,10 @@ on:
         description: "Force rebuild"
         type: boolean
         default: true
+      vendor_mods:
+        description: "顺带编译 vendor wifi 模块 (qca_cld3_wlan.ko / cnss2.ko), 用于替换 /vendor/lib/modules"
+        type: boolean
+        default: true
 
 jobs:
   build:
@@ -50,6 +56,12 @@ jobs:
         run: |
           echo "kernel_ref=${{ inputs.kernel_ref || env.kernel_ref }}" | tee -a $GITHUB_ENV
           echo "abi_mode=${{ inputs.abi_mode || 'strict' }}" | tee -a $GITHUB_ENV
+          # inputs.vendor_mods 是 boolean, 未传时为空串 -> 回落到 workflow 级默认 true
+          if [ "${{ inputs.vendor_mods }}" = "false" ]; then
+            echo "build_vendor_mods=false" | tee -a $GITHUB_ENV
+          else
+            echo "build_vendor_mods=true" | tee -a $GITHUB_ENV
+          fi
 
       - name: Install packages
         run: |
@@ -380,6 +392,90 @@ jobs:
             echo "=== ABI self-check skipped (abi_mode=none) ==="
           fi
 
+      # ---------------------------------------------------------------------
+      # 用同一棵树编 vendor DLKM (WiFi 那一套)
+      #
+      # 为什么要自己编: 设备 /vendor/lib/modules 下的 qca_cld3_wlan.ko 是从小米
+      # 未公开的 4.14.180 出厂树编出来的, 换任何一棵公开树都过不了
+      # check_version() —— 实测 518 条符号只有 229 条对得上 (44%), 连
+      # `void __stack_chk_fail(void)` 这种无参函数都对不上, 所以对齐 ABI 这条路
+      # 已经封死. 唯一正确解是让模块和内核同源: 用我们自己的 .config 编出
+      # wlan.ko / cnss2.ko, 再把它们换到 /vendor/lib/modules 里.
+      #
+      # 出厂 defconfig 里 CNSS*/QCA_CLD_WLAN 全是 n (vendor 把它们做成独立 .ko),
+      # 这里临时打开成 m, 只影响这次的 modules 输出, 不改变 Image.
+      # ---------------------------------------------------------------------
+      - name: Build vendor DLKMs (wlan stack)
+        if: ${{ env.build_vendor_mods == 'true' }}
+        working-directory: kernel
+        run: |
+          set -x
+          MK="make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            HOSTCC=gcc HOSTCFLAGS=-fcommon \
+            KCFLAGS=-fcommon"
+
+          cp out/.config out/.config.image   # 留底: Image 的配置, 方便对比
+
+          cat >> out/.config <<'EOF'
+          CONFIG_CNSS2=m
+          CONFIG_CNSS2_QMI=y
+          CONFIG_CNSS_UTILS=m
+          CONFIG_CNSS_PREALLOC=m
+          CONFIG_QCA_CLD_WLAN=m
+          CONFIG_QCA_CLD_WLAN_PROFILE="default"
+          EOF
+
+          $MK olddefconfig
+          echo "=== wlan stack config 生效情况 ==="
+          grep -E '^CONFIG_(CNSS|CNSS2|QCA_CLD_WLAN)' out/.config || true
+          for o in CONFIG_CNSS2 CONFIG_QCA_CLD_WLAN; do
+            grep -q "^$o=m" out/.config || { echo "ERROR: $o 没生效, 编不出 wi-fi 模块"; exit 1; }
+          done
+
+          # -k: 树里其它 =m 的驱动坏掉不要连累 wifi
+          set +e
+          $MK -j$(nproc --all) -k modules 2>&1 | tee modules.log
+          set -e
+
+          echo "=== 生成的 .ko ==="
+          find out -name '*.ko' -newer out/.config.image | sort | sed 's|^out/||'
+          echo "=== wlan 栈 ==="
+          ls -la out/drivers/staging/qcacld-3.0/*.ko \
+                 out/drivers/net/wireless/cnss2/*.ko 2>/dev/null || true
+
+          test -f out/drivers/staging/qcacld-3.0/wlan.ko \
+            || { echo "ERROR: wlan.ko 没编出来"; grep -nE 'error:|Error [0-9]' modules.log | tail -30; exit 1; }
+          echo "wlan.ko OK"
+
+      - name: Package vendor modules
+        if: ${{ env.build_vendor_mods == 'true' }}
+        run: |
+          set -e
+          OUT=vendor-modules
+          rm -rf $OUT && mkdir -p $OUT
+          # 设备上的文件名 <- 我们的模块名。MIUI 把 qcacld 的 wlan.ko 改名成
+          # qca_cld3_wlan.ko, 其余同名。
+          cp kernel/out/drivers/staging/qcacld-3.0/wlan.ko $OUT/qca_cld3_wlan.ko
+          cp kernel/out/drivers/net/wireless/cnss2/cnss2.ko $OUT/ 2>/dev/null || true
+          cp kernel/out/drivers/net/wireless/cnss_utils/cnss_utils.ko $OUT/ 2>/dev/null || true
+          cp kernel/out/drivers/net/wireless/cnss_prealloc/cnss_prealloc.ko $OUT/ 2>/dev/null || true
+          # 其它可能存在的 wlan 相关模块, 有就带上
+          find kernel/out -name '*.ko' | grep -iE 'cnss|wlan|qca' | while read f; do
+            cp -n "$f" $OUT/ 2>/dev/null || true
+          done
+          ls -la $OUT
+          cp this-repo/tools/install-vendor-modules.sh $OUT/install.sh
+          {
+            echo "# 由 $(git -C this-repo rev-parse --short HEAD) 于 $(date -u) 生成"
+            echo "# kernel.release: $(cat kernel/out/include/config/kernel.release)"
+            echo "# 目标: /vendor/lib/modules"
+            ls $OUT
+          } > $OUT/MANIFEST
+          tar -czf vendor-modules.tar.gz -C $OUT .
+          ls -la vendor-modules.tar.gz
+
       - name: Pack boot.img
         run: |
           python3 this-repo/cepheus/scripts/build_bootimg.py \
@@ -398,7 +494,10 @@ jobs:
             boot.img
             boot.img.md5
             kernel/out/.config
+            vendor-modules.tar.gz
+            kernel/modules.log
           retention-days: 30
+          if-no-files-found: warn
 
       - name: Release
         uses: softprops/action-gh-release@v2
