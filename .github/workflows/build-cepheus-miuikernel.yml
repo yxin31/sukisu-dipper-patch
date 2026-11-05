@@ -346,6 +346,16 @@ jobs:
             fi
           fi
 
+          # cepheus 原厂 DTB 的 pcie@1c00000 节点里没有 perst-gpio 属性,
+          # 而本树 pci-msm 把它标成 required=true -> probe -2 失败 ->
+          # PCIe RC0 永远不绑定 -> cnss 拿不到 RC0 -> WiFi 起不来。
+          # 实机日志:
+          #   msm_pcie_get_resources: Could not get required GPIO perst-gpio
+          #   msm_pcie_probe: PCIe: Driver probe failed for RC0:-2
+          if [ "${{ env.build_vendor_mods }}" = "true" ] && [ -f drivers/pci/host/pci-msm.c ]; then
+            python3 "$GITHUB_WORKSPACE/this-repo/scripts/fix-pci-msm-perst.py"
+          fi
+
       - name: Build kernel
         working-directory: kernel
         run: |
