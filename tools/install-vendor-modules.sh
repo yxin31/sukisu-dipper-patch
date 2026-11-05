@@ -3,19 +3,22 @@
 #
 # 用法(设备上, root):
 #   adb push vendor-modules.tar.gz /data/local/tmp/
-#   adb shell su -c 'cd /data/local/tmp && tar -xzf vendor-modules.tar.gz -C vm && sh vm/install.sh'
+#   adb shell su -c 'mkdir -p /data/local/tmp/vm && \
+#       tar -xzf /data/local/tmp/vendor-modules.tar.gz -C /data/local/tmp/vm && \
+#       sh /data/local/tmp/vm/install.sh'
 #
-# 或者把本脚本和 .ko 一起放到同一目录后直接:
-#   su -c 'sh install.sh'
+#   sh install.sh check     只读检查, 不写任何东西 (推荐先跑这个)
+#   sh install.sh install   真正替换 (默认)
+#   sh install.sh rollback  从备份还原
 #
 # 注意: /vendor 是只读的 dm-verity 分区, 必须先关 verity 才能写:
 #   adb root && adb disable-verity && adb reboot
-# 重启后再 adb root && adb remount (或本脚本里的 mount -o rw,remount)
 
 set -u
 DEST=/vendor/lib/modules
 BAK=/data/local/tmp/vendor-modules-backup
 SRC=$(cd "$(dirname "$0")" && pwd)
+ACTION="${1:-install}"
 
 say() { echo "[vm] $*"; }
 die() { echo "[vm] ERROR: $*"; exit 1; }
@@ -23,70 +26,120 @@ die() { echo "[vm] ERROR: $*"; exit 1; }
 [ "$(id -u)" = "0" ] || die "需要 root (su -c 'sh install.sh')"
 [ -d "$DEST" ] || die "$DEST 不存在, 这不是 cepheus MIUI?"
 
-say "源目录: $SRC"
-say "目标  : $DEST"
+KREL=$(uname -r)
+say "内核 release: $KREL"
+say "源目录      : $SRC"
+say "目标        : $DEST"
 
-# ---- 1. 让 /vendor 可写 ----
+# 每个 .ko 的 vermagic 与当前内核比对 —— 不一致的一律不能换进去
+ko_vermagic() {
+  strings -a "$1" 2>/dev/null | grep -m1 '^vermagic=' | sed 's/^vermagic=//'
+}
+
+# ---------------------------------------------------------------- rollback
+if [ "$ACTION" = "rollback" ]; then
+  [ -d "$BAK" ] || die "$BAK 里没有备份"
+  n=0
+  for f in "$BAK"/*.ko; do
+    [ -f "$f" ] || continue
+    b=$(basename "$f")
+    cp -f "$f" "$DEST/$b" && { chmod 0644 "$DEST/$b"; n=$((n+1)); say "还原 $b"; }
+  done
+  [ "$n" -gt 0 ] || die "备份目录是空的"
+  say "还原了 $n 个, sync 后 reboot"
+  sync
+  exit 0
+fi
+
+# ------------------------------------------------------------------- check
+if [ "$ACTION" = "check" ]; then
+  say "== 本包内的模块 =="
+  for f in "$SRC"/*.ko; do
+    [ -f "$f" ] || continue
+    printf '  %-28s %s\n' "$(basename "$f")" "$(ko_vermagic "$f")"
+  done
+  say "== 设备上现有的模块 =="
+  for f in "$DEST"/qca_cld3_wlan.ko "$DEST"/cnss2.ko "$DEST"/cnss_utils.ko "$DEST"/cnss_prealloc.ko; do
+    [ -f "$f" ] || { printf '  %-28s (不存在)\n' "$(basename "$f")"; continue; }
+    printf '  %-28s %s\n' "$(basename "$f")" "$(ko_vermagic "$f")"
+  done
+  say "== 当前已加载 =="
+  for m in cnss2 cnss_utils cnss_prealloc wlan qca_cld3_wlan; do
+    [ -d "/sys/module/$m" ] && echo "  [LOADED] $m  refcnt=$(cat /sys/module/$m/refcnt 2>/dev/null)" \
+                            || echo "  [  --  ] $m"
+  done
+  say "== /vendor 可写? =="
+  if touch "$DEST/.vm_write_test" 2>/dev/null; then
+    rm -f "$DEST/.vm_write_test"; say "可写 (verity 已关)"
+  else
+    say "不可写 —— 需要先: adb root && adb disable-verity && adb reboot"
+  fi
+  exit 0
+fi
+
+# ----------------------------------------------------------------- install
+WORK=$(mktemp -d /data/local/tmp/vm.XXXXXX) || die "mktemp 失败"
+trap 'rm -rf "$WORK"' EXIT
+
+# ---- 1. 只挑 vermagic 与当前内核完全一致的模块 ----
+say "逐个校验 vermagic (必须逐字符等于 $KREL)"
+OK=""
+for f in "$SRC"/*.ko; do
+  [ -f "$f" ] || continue
+  n=$(basename "$f")
+  v=$(ko_vermagic "$f")
+  if [ "$v" = "$KREL" ]; then
+    cp -f "$f" "$WORK/$n" && OK="$OK $n"
+    say "  [ok]   $n"
+  else
+    say "  [skip] $n  vermagic='$v' != '$KREL'"
+  fi
+done
+[ -n "$OK" ] || die "没有一个模块的 vermagic 匹配, 别换了, 会白折腾"
+
+# ---- 2. /vendor 可写? ----
 if ! touch "$DEST/.vm_write_test" 2>/dev/null; then
   say "/vendor 只读, 尝试 remount rw"
   mount -o rw,remount /vendor 2>/dev/null || \
     mount -o rw,remount -t ext4 /dev/block/bootdevice/by-name/vendor /vendor 2>/dev/null || true
 fi
-if ! touch "$DEST/.vm_write_test" 2>/dev/null; then
-  die "$DEST 仍然不可写 —— 需要先在电脑上执行:
-       adb root && adb disable-verity && adb reboot
-     重启后再跑一次本脚本 (或者 adb root && adb remount)"
-fi
+touch "$DEST/.vm_write_test" 2>/dev/null || die "$DEST 不可写 —— 先执行:
+       adb root && adb disable-verity && adb reboot"
 rm -f "$DEST/.vm_write_test"
 say "/vendor 可写"
 
-# ---- 2. 备份 ----
+# ---- 3. 备份 ----
 mkdir -p "$BAK"
-say "备份到 $BAK (已存在的不覆盖)"
-for f in "$DEST"/*.ko; do
-  b="$BAK/$(basename "$f")"
-  [ -f "$b" ] || cp -p "$f" "$b"
+for n in $OK; do
+  [ -f "$DEST/$n" ] && { [ -f "$BAK/$n" ] || cp -p "$DEST/$n" "$BAK/$n"; }
 done
+say "原厂模块已备份到 $BAK"
 
-# ---- 3. 替换 ----
+# ---- 4. 替换 ----
 REPLACED=""
-SKIPPED=""
-for f in "$SRC"/*.ko; do
-  [ -f "$f" ] || continue
-  n=$(basename "$f")
-  if [ -f "$DEST/$n" ]; then
-    cp -f "$f" "$DEST/$n" || die "拷贝 $n 失败"
-    chmod 0644 "$DEST/$n"
-    chcon u:object_r:vendor_file:s0 "$DEST/$n" 2>/dev/null || true
-    REPLACED="$REPLACED $n"
-    say "替换 $n  ($(wc -c < "$f") bytes)"
-  else
-    SKIPPED="$SKIPPED $n"
-    say "跳过 $n (设备上没有同名文件)"
+for n in $OK; do
+  cp -f "$WORK/$n" "$DEST/$n" || die "拷贝 $n 失败"
+  chmod 0644 "$DEST/$n"
+  chcon u:object_r:vendor_file:s0 "$DEST/$n" 2>/dev/null || true
+  REPLACED="$REPLACED $n"
+  say "替换 $n"
+done
+
+# ---- 5. cnss_utils 已内建进内核, 原厂那个模块留着只会加载失败 ----
+if [ -f "$DEST/cnss_utils.ko" ] && ! ls "$SRC"/cnss_utils.ko >/dev/null 2>&1; then
+  if [ ! -f "$BAK/cnss_utils.ko" ]; then
+    cp -p "$DEST/cnss_utils.ko" "$BAK/cnss_utils.ko"
   fi
-done
+  mv -f "$DEST/cnss_utils.ko" "$DEST/cnss_utils.ko.disabled" 2>/dev/null && \
+    say "禁用原厂 cnss_utils.ko (本内核已内建同名功能)"
+fi
 
-[ -n "$REPLACED" ] || die "一个都没替换成功, 检查 tar 包内容"
-
-# ---- 4. 报告仍然不匹配的原厂模块 ----
-echo
+sync
 say "已替换:$REPLACED"
-[ -n "$SKIPPED" ] && say "未使用:$SKIPPED"
-
-echo
-say "剩下的原厂 .ko (它们的 CRC 与我们的内核不一致, 下次开机会报"
-say "'disagrees about version of symbol module_layout', 属于预期):"
-for f in "$DEST"/*.ko; do
-  n=$(basename "$f")
-  case " $REPLACED " in *" $n "*) continue;; esac
-  echo "   $n"
-done
-
-cat <<'EOM'
+cat <<EOM
 
 [vm] 完成。下一步:
-      sync
-      reboot
-     重启后看 dmesg | grep -i -E 'wlan|cnss' 以及 lsmod
-     要回滚: 把 /data/local/tmp/vendor-modules-backup/*.ko 拷回 /vendor/lib/modules
+     reboot
+     重启后: dmesg | grep -iE 'cnss|wlan'  和  lsmod | grep -E 'cnss|wlan'
+     要回滚: sh $SRC/install.sh rollback
 EOM
