@@ -204,7 +204,16 @@ jobs:
             echo "=== 编译没有产出 vmlinux, 跳过 ABI 比对 (先修编译错误) ==="
             exit 0
           fi
-          python3 this-repo/scripts/crc-report.py kernel/vmlinux --strict
+          python3 this-repo/scripts/crc-report.py kernel/vmlinux --strict --dump abi-dump
+
+      - name: Upload ABI dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: abi-dump
+          path: abi-dump/
+          retention-days: 7
 
       - name: vermagic check
         working-directory: kernel
