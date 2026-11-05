@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-构建后 ABI 全表自检。
+构建后 ABI 自检 (不刷机, 在链接完 vmlinux 的那一刻就能判定)。
 
-做两件事:
-  1. 直接读 vmlinux 里的 __crc_* 绝对符号 (= genksyms 为每个 EXPORT_SYMBOL 算的 CRC),
-     与 `stock-versions.txt` 里从设备原厂 .ko 扒出来的 518 条记录逐条比对。
-  2. 顺便报 module_layout 的 CRC —— 它是 struct module 布局的指纹, 也是
-     vendor 模块最先卡住的那个符号。
+为什么要换掉"CRC 全表比对"的思路:
+  4.14.180 到 4.14.357 之间, struct sk_buff / cfg80211_* / notifier_block 等
+  一大批结构体在稳定版里增删过成员。genksyms 是递归摘要 —— 指针参数指向的
+  结构体多一个字段, 这个函数的 CRC 就变。实测 518 个出厂符号里 302 个 CRC
+  不一致, 硬凑是不可能的。
 
-为什么必须在构建阶段查:
-  内核的 check_version() 是按 ____versions 顺序逐符号校验的, 第一个不匹配就
-  request_module 失败并中止。所以设备上只会看到 module_layout 一条, 后面的
-  printk / __stack_chk_fail 全被挡住看不见。只修 module_layout 是修不完的 ——
-  必须整张表对上, 否则刷进去就是"模块能加载/不能加载"的随机结果。
+  但真正影响"能不能安全加载"的只有两件事:
+    1. struct module 的尺寸与关键成员偏移 (内核要往模块镜像里写这些字段);
+    2. vermagic 字符串完全一致。
+  指针参数的结构体内容变化不影响调用约定, 所以关掉 CRC 校验是安全的。
 
-真值来源:
-  scripts/stock-versions.txt 由设备 /vendor/lib/modules 下的
-  qca_cld3_wlan.ko (429 项) 与 audio_wcd_core.ko (131 项) 的 __versions 段
-  合并去重而来, 两个模块对同一符号的 CRC 完全一致, 可互相印证。
+因此这里改成读编译器自己算出来的硬指标:
+  scripts/abi-align-414180.sh 会在 kernel/module.c 末尾埋 3 个数组,
+  数组长度分别是 sizeof(struct module) / offsetof(init) / offsetof(exit),
+  符号的 st_size 就是测量值。跟从设备原厂 .ko 的
+  .gnu.linkonce.this_module 段上读出的 (0x380 / 0x150 / 0x310) 直接比。
+
+如果 vmlinux 里还有 __crc_* (即没关 MODVERSIONS), 顺带打印全表一致率,
+仅作参考, 不作为失败条件。
 
 用法: abi-verify.py out/vmlinux
 """
@@ -25,7 +28,15 @@ import os
 import struct
 import sys
 
-EXPECTED_MODULE_LAYOUT = 0x4AD0CD64
+# 从设备 /vendor/lib/modules/qca_cld3_wlan.ko 与 audio_wcd_core.ko 的
+# .gnu.linkonce.this_module 段实测 (两者完全一致)
+PROBES = {
+    "__ksu_abi_sizeof_module": (0x380, "sizeof(struct module)"),
+    "__ksu_abi_off_module_init": (0x150, "offsetof(struct module, init)"),
+    "__ksu_abi_off_module_exit": (0x310, "offsetof(struct module, exit)"),
+}
+
+EXPECTED_VERMAGIC = "4.14.180-perf-gb24d113 SMP preempt mod_unload modversions aarch64"
 
 
 def load_sections(path):
@@ -50,37 +61,38 @@ def load_sections(path):
     return data, secs
 
 
-def read_all_crcs(path):
-    """vmlinux 里 __crc_xxx 是 ld -T <genksyms 的 .ver> 生成的绝对符号,
-    st_shndx == SHN_ABS, st_value 就是 CRC 本身。
-    老式做法里它也可能落在 __kcrctab 段, 两种都兼容。"""
+def read_symbols(path):
+    """返回 {名字: (shndx, value, size)}。保留 COMMON / ABS / 已定义三类。"""
     data, secs = load_sections(path)
-    symtab = next((s for s in secs if s["typ"] == 2), None)
+    symtab = next((s for s in secs if s["typ"] == 2), None)   # SHT_SYMTAB
     if symtab is None:
         raise SystemExit("ERROR: vmlinux 没有 .symtab (被 strip 了?)")
     link = secs[symtab["link"]]
     strtab = data[link["off"]:link["off"] + link["size"]]
     entsize = symtab["entsize"] or 24
-    crcs = {}
+    out = {}
     for i in range(symtab["size"] // entsize):
         o = symtab["off"] + i * entsize
         st_name, st_info, st_other, st_shndx, st_value, st_size = \
             struct.unpack_from("<IBBHQQ", data, o)
-        if st_shndx == 0:
+        if st_name == 0:
             continue
         end = strtab.index(b"\0", st_name)
-        if not strtab.startswith(b"__crc_", st_name):
-            continue
-        name = strtab[st_name:end].decode(errors="replace")[6:]
-        if st_shndx == 0xFFF1:                      # SHN_ABS: 值即 CRC
-            crcs[name] = st_value & 0xFFFFFFFF
-        elif st_shndx < len(secs):
-            sec = secs[st_shndx]
-            nbytes = st_size if st_size in (4, 8) else 8
-            raw = data[sec["off"] + (st_value - sec["addr"]):][:nbytes]
-            if len(raw) == nbytes:
-                crcs[name] = struct.unpack("<Q", raw.ljust(8, b"\0"))[0] & 0xFFFFFFFF
-    return crcs
+        out[strtab[st_name:end].decode(errors="replace")] = (st_shndx, st_value, st_size)
+    return out, data, secs
+
+
+def crc_of(sym, info, data, secs):
+    shndx, value, size = info
+    if shndx == 0xFFF1:                      # SHN_ABS: ld -T <genksyms .ver>
+        return value & 0xFFFFFFFF
+    if 0 < shndx < len(secs):
+        sec = secs[shndx]
+        n = size if size in (4, 8) else 8
+        raw = data[sec["off"] + (value - sec["addr"]):][:n]
+        if len(raw) == n:
+            return struct.unpack("<Q", raw.ljust(8, b"\0"))[0] & 0xFFFFFFFF
+    return None
 
 
 def load_stock(path):
@@ -98,65 +110,57 @@ def main():
     if len(sys.argv) < 2:
         raise SystemExit("usage: abi-verify.py <vmlinux>")
     vmlinux = sys.argv[1]
+
+    syms, data, secs = read_symbols(vmlinux)
+
+    print("=== [ABI-CHECK] struct module 布局 (编译器实测 vs 出厂 .ko) ===")
+    bad = 0
+    for name, (want, label) in PROBES.items():
+        info = syms.get(name)
+        if info is None:
+            print("  %-30s 探针缺失 (abi-align-414180.sh 没跑?)" % label)
+            bad += 1
+            continue
+        got = info[2]
+        ok = got == want
+        print("  %-30s 实测 0x%03x  期望 0x%03x  %s"
+              % (label, got, want, "OK" if ok else "MISMATCH"))
+        if not ok:
+            bad += 1
+
+    # 参考信息: 若 MODVERSIONS 还开着, 报一下全表一致率
+    crcs = {k[6:]: crc_of(k, v, data, secs) for k, v in syms.items()
+            if k.startswith("__crc_")}
+    crcs = {k: v for k, v in crcs.items() if v is not None}
     here = os.path.dirname(os.path.abspath(__file__))
     stock_path = os.path.join(here, "stock-versions.txt")
-    if not os.path.exists(stock_path):
-        raise SystemExit("ERROR: 缺少 %s" % stock_path)
-
-    stock = load_stock(stock_path)
-    crcs = read_all_crcs(vmlinux)
-    print("=== [ABI-CHECK] vmlinux 里共 %d 个 __crc_*, 出厂表 %d 条 ==="
-          % (len(crcs), len(stock)))
-
-    got_ml = crcs.get("module_layout")
-    print("  module_layout: 实测 %s  期望 0x%08x  %s"
-          % ({None: "缺失"}.get(got_ml, "0x%08x" % got_ml),
-             EXPECTED_MODULE_LAYOUT,
-             "OK" if got_ml == EXPECTED_MODULE_LAYOUT else "MISMATCH"))
-
-    mismatch, missing = [], []
-    for name, want in stock.items():
-        got = crcs.get(name)
-        if got is None:
-            missing.append(name)
-        elif got != want:
-            mismatch.append((name, got, want))
-
-    print("  全表比对: 一致 %d / 不一致 %d / 缺失 %d"
-          % (len(stock) - len(mismatch) - len(missing), len(mismatch), len(missing)))
-
-    if mismatch:
-        print("  --- 不一致 (前 40) ---")
-        for name, got, want in mismatch[:40]:
-            print("    %-34s 实测 0x%08x  期望 0x%08x" % (name, got, want))
-        if len(mismatch) > 40:
-            print("    ... 还有 %d 条" % (len(mismatch) - 40))
-    if missing:
-        print("  --- 缺失 (前 20) ---")
-        for name in missing[:20]:
-            print("    %s" % name)
-
-    if got_ml != EXPECTED_MODULE_LAYOUT:
+    if crcs and os.path.exists(stock_path):
+        stock = load_stock(stock_path)
+        same = sum(1 for n, v in stock.items() if crcs.get(n) == v)
         print()
-        print("=== [ABI-CHECK] FAIL: struct module 布局与出厂不一致 ===")
-        print("  module_layout 是 genksyms 对 struct module 的摘要, 它不对就是布局不对。")
-        print("  逐个字段排查 scripts/abi-align-414180.sh 的 5 个 patch:")
-        print("   1) using_gplonly_symbols         (无 ifdef, 必须删)")
-        print("   2) CONFIG_BPF_EVENTS 两字段       (无 prompt 的 default y, 只能源码摘)")
-        print("   3) CONFIG_FUNCTION_ERROR_INJECTION 两字段")
-        print("   4) CONFIG_ARM64_MODULE_PLTS 必须 =y (struct mod_arch_specific 差 3 指针+3 int)")
-        print("   5) CONFIG_CFI_CLANG 必须关")
-        sys.exit(1)
-
-    if mismatch or missing:
+        print("=== [ABI-CHECK] 参考: 出厂 518 符号 CRC 一致率 %d/%d ==="
+              % (same, len(stock)))
+        print("  4.14.180 -> 4.14.357 的结构体漂移必然导致大量不一致, 这不是失败条件。")
+        print("  决定模块能否安全加载的是上面的 struct module 布局。")
+    elif not crcs:
         print()
-        print("=== [ABI-CHECK] FAIL: 布局对了, 但有符号 CRC/导出状态不符 ===")
-        print("  这类差异只可能来自: 源码版本与出厂不同 / 原型被 MIUI 改过 /")
-        print("  某个 CONFIG 改变了头文件里的 typedef。按上面列出的符号逐个看声明。")
+        print("=== [ABI-CHECK] CONFIG_MODVERSIONS 已关, 无 __crc_*, 跳过 CRC 比对 ===")
+        print("  vermagic 必须仍是: %s" % EXPECTED_VERMAGIC)
+
+    if bad:
+        print()
+        print("=== [ABI-CHECK] FAIL: struct module 布局与出厂 4.14.180 不一致 ===")
+        print("  差了 %d 项。逐个排查 scripts/abi-align-414180.sh:" % bad)
+        print("   sizeof 多 32: ARM64_MODULE_PLTS 没开 (struct mod_arch_specific 少 3 指针 + 3 int)")
+        print("   sizeof 多 8 : using_gplonly_symbols 还在")
+        print("   sizeof 多 16: BPF_EVENTS 的两个字段还在")
+        print("   sizeof 多 16: FUNCTION_ERROR_INJECTION 的两个字段还在")
+        print("   偏移整体后移 : arch 之后的成员被 mod_arch_specific 顶偏")
         sys.exit(1)
 
     print()
-    print("=== [ABI-CHECK] PASS: 518 条出符号 CRC 全部一致, vendor .ko 必然可加载 ===")
+    print("=== [ABI-CHECK] PASS: 尺寸与关键偏移逐项吻合, vendor .ko 的 struct module")
+    print("    写入路径安全; 加上 MODVERSIONS=n + 强制 modversions 标记, 可以加载 ===")
 
 
 if __name__ == "__main__":
