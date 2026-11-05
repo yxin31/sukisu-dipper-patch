@@ -29,6 +29,11 @@ on:
         description: "Kernel branch (default: 16-ksun_susfs)"
         required: false
         default: "16-ksun_susfs"
+      abi_mode:
+        description: "ABI 模式: strict=只对齐 struct module 布局(vendor 模块仍被 CRC 挡掉) / permissive=再关 MODVERSIONS 放行 vendor 模块 / none=完全不打补丁"
+        type: choice
+        options: [strict, permissive, none]
+        default: strict
       allow_rebuild:
         description: "Force rebuild"
         type: boolean
@@ -44,6 +49,7 @@ jobs:
       - name: Set env
         run: |
           echo "kernel_ref=${{ inputs.kernel_ref || env.kernel_ref }}" | tee -a $GITHUB_ENV
+          echo "abi_mode=${{ inputs.abi_mode || 'strict' }}" | tee -a $GITHUB_ENV
 
       - name: Install packages
         run: |
@@ -180,9 +186,14 @@ jobs:
           # 以及 RELOCATABLE=n 把 ARM64_MODULE_PLTS 连带关掉, 少 40 字节的
           # struct mod_arch_specific。全部处理逻辑见 scripts/abi-align-414180.sh。
           #
-          # 注意: 绝不能再走"关 MODVERSIONS 强行放行"那条路(r7)。校验能绕过,
-          # 但成员偏移是错的, refcnt/exit 写坏内存 -> 开机几秒后重启循环。
-          bash ../this-repo/scripts/abi-align-414180.sh "$DEFCONFIG"
+          # 注意: "关 MODVERSIONS 强行放行"(r7) 单独用是不行的, 成员偏移还是错的。
+          # 现在的做法是先把布局真对齐(本脚本 1~4 步 + 6 步探针), 再按 abi_mode
+          # 决定要不要放行 vendor 模块。
+          if [ "$abi_mode" != "none" ]; then
+            bash ../this-repo/scripts/abi-align-414180.sh "$DEFCONFIG" "$abi_mode"
+          else
+            echo "### abi_mode=none: 跳过 ABI 补丁 (退回 r6 行为)"
+          fi
 
           # 不用 clang 的 LTO
           sed -i 's/^CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' $DEFCONFIG
@@ -310,14 +321,26 @@ jobs:
           for o in CONFIG_ARM64_MODULE_PLTS CONFIG_MODULE_UNLOAD CONFIG_PREEMPT CONFIG_SMP CONFIG_MODULES; do
             grep -q "^$o=y" out/.config || { echo "ERROR: $o != y, struct module 布局会与出厂不一致"; exit 1; }
           done
-          # MODVERSIONS 必须是 n: 出厂 518 个符号里 302 个 CRC 因 4.14.180->357 的
-          # 结构体漂移天然不一致, 校验开着就永远加载不了 vendor 模块。
-          grep -q '^# CONFIG_MODVERSIONS is not set' out/.config \
-            || { echo "ERROR: MODVERSIONS 必须关闭"; exit 1; }
-          grep -q 'forced-vendor-dlkm' include/linux/vermagic.h \
-            || { echo "ERROR: vermagic.h 的 modversions 标记没强制打开, vendor .ko 会拒载"; exit 1; }
-          grep -q '__ksu_abi_sizeof_module' kernel/module.c \
-            || { echo "ERROR: struct module 探针没埋上"; exit 1; }
+          echo "abi_mode=${{ env.abi_mode }}"
+          if [ "${{ env.abi_mode }}" = "permissive" ]; then
+            grep -q '^# CONFIG_MODVERSIONS is not set' out/.config \
+              || { echo "ERROR: permissive 模式下 MODVERSIONS 必须关闭"; exit 1; }
+            grep -q 'forced-vendor-dlkm' include/linux/vermagic.h \
+              || { echo "ERROR: vermagic.h 的 modversions 标记没强制打开, vendor .ko 会拒载"; exit 1; }
+          elif [ "${{ env.abi_mode }}" = "strict" ]; then
+            grep -q '^CONFIG_MODVERSIONS=y' out/.config \
+              || { echo "ERROR: strict 模式下 MODVERSIONS 必须保持 y"; exit 1; }
+          fi
+          if [ "${{ env.abi_mode }}" != "none" ]; then
+            grep -q '__ksu_abi_sizeof_module' kernel/module.c \
+              || { echo "ERROR: struct module 探针没埋上"; exit 1; }
+            [ "$(grep -c 'ABI: 4.14.180 的 struct module 没有这两个成员' include/linux/module.h)" = "2" ] \
+              || { echo "ERROR: module.h 的 ABI 补丁不完整 (应有 2 处 #if 0)"; exit 1; }
+            grep -q 'ABI: struct module 无 bpf_raw_events' kernel/module.c \
+              || { echo "ERROR: module.c 的 bpf_raw_events 补丁没生效"; exit 1; }
+            grep -q 'ABI: struct module 无 ei_funcs' kernel/module.c \
+              || { echo "ERROR: module.c 的 ei_funcs 补丁没生效"; exit 1; }
+          fi
           # BPF_EVENTS (bool + default y) 和 FUNCTION_ERROR_INJECTION (def_bool y)
           # 都是"无 prompt"的符号, defconfig 里写 not set 会被 olddefconfig 重算掉,
           # 已改为在源码里摘字段 (scripts/abi-align-414180.sh 第 2~4 步)。
@@ -328,12 +351,6 @@ jobs:
             echo "ERROR: CFI_CLANG=y, struct module 会多一个 cfi_check 成员"; exit 1
           fi
           echo "CFI_CLANG: not enabled (ok)"
-          [ "$(grep -c 'ABI: 4.14.180 的 struct module 没有这两个成员' include/linux/module.h)" = "2" ] \
-            || { echo "ERROR: module.h 的 ABI 补丁不完整 (应有 2 处 #if 0)"; exit 1; }
-          grep -q 'ABI: struct module 无 bpf_raw_events' kernel/module.c \
-            || { echo "ERROR: module.c 的 bpf_raw_events 补丁没生效"; exit 1; }
-          grep -q 'ABI: struct module 无 ei_funcs' kernel/module.c \
-            || { echo "ERROR: module.c 的 ei_funcs 补丁没生效"; exit 1; }
           grep -q '^CONFIG_ARM64_MODULE_CMODEL_LARGE=y' out/.config || { echo "ERROR: CMODEL_LARGE 没跟着 PLTS 打开"; exit 1; }
           if grep -q '^CONFIG_RELOCATABLE=y' out/.config; then echo "ERROR: RELOCATABLE=y 但代码非 PIE"; exit 1; fi
 
@@ -356,8 +373,12 @@ jobs:
           echo "vermagic compatible: $CAT"
 
           # ABI 自检: 链接阶段就定了的事, 不要靠刷机去试
-          echo "=== ABI self-check (vmlinux __kcrctab vs 出厂 .ko) ==="
-          python3 ../this-repo/scripts/abi-verify.py out/vmlinux
+          if [ "${{ env.abi_mode }}" != "none" ]; then
+            echo "=== ABI self-check (struct module probes vs 出厂 .ko) ==="
+            python3 ../this-repo/scripts/abi-verify.py out/vmlinux
+          else
+            echo "=== ABI self-check skipped (abi_mode=none) ==="
+          fi
 
       - name: Pack boot.img
         run: |
@@ -390,6 +411,7 @@ jobs:
             **Why this tree:** 小米 OSS 的 `cepheus-q-oss` 是 4.14.117 的 A10 基线, 缺 ICE block backport 与全部 MIUI 专有驱动, 编出来刷 MIUI 必卡 logo。这棵树是 MIUI 内核树。
             **Config:** `${{ env.defconfig }}` (出厂配置) + `CONFIG_KSU` / `CONFIG_KSU_SUSFS`
             **Reported version:** 4.14.${{ env.stock_kernel_sublevel }}${{ env.stock_localversion }} (vermagic 与原厂一致)
+            **ABI mode:** `${{ env.abi_mode }}` — strict: 只对齐 struct module 布局, vendor DLKM 仍被 CRC 挡掉; permissive: 额外关掉 MODVERSIONS 放行 vendor DLKM; none: 无补丁
             **Root:** KernelSU-Next (legacy-susfs-v2) · **Hide:** SUSFS v2.3.0
 
             ### Flash
