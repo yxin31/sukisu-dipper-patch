@@ -93,8 +93,13 @@ def load_stock(path):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     strict = "--strict" in sys.argv
+    dump = None
+    for i, a in enumerate(sys.argv):
+        if a == "--dump" and i + 1 < len(sys.argv):
+            dump = sys.argv[i + 1]
+            args = [x for x in args if x != dump]
     if not args:
-        raise SystemExit("usage: crc-report.py <vmlinux> [--strict]")
+        raise SystemExit("usage: crc-report.py <vmlinux> [--strict] [--dump DIR]")
     vmlinux = args[0]
 
     syms, data, secs = read_symbols(vmlinux)
@@ -147,6 +152,24 @@ def main():
         print("  " + ", ".join(sorted(missing)[:30]))
 
     print()
+    if dump:
+        os.makedirs(dump, exist_ok=True)
+        # 518 行全表: 状态 / 符号 / 出厂 / 本树
+        with open(os.path.join(dump, "abi-518.tsv"), "w", encoding="utf-8") as f:
+            f.write("status\tname\tfactory\tours\n")
+            for name in sorted(stock):
+                have = got.get(name)
+                st = ("same" if have == stock[name] else
+                      "missing" if have is None else "diff")
+                f.write("%s\t%s\t0x%08x\t%s\n" % (
+                    st, name, stock[name],
+                    "0x%08x" % have if have is not None else "-"))
+        # 本内核全部 __crc_* (给跨树对比用)
+        with open(os.path.join(dump, "crc-all.txt"), "w", encoding="utf-8") as f:
+            for name in sorted(got):
+                f.write("0x%08x %s\n" % (got[name], name))
+        print("=== [CRC] 已导出 %s/abi-518.tsv 与 %s/crc-all.txt ===" % (dump, dump))
+
     if not diff and not missing:
         print("=== [CRC] PASS: 518 条全部一致 ===")
         print("    这棵树与出厂 4.14.180 的导出类型完全一致, vendor .ko 可以安全加载。")
