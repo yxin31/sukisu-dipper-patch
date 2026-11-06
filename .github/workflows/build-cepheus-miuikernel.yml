@@ -21,7 +21,7 @@ env:
   defconfig: cepheus_stock_defconfig
   stock_kernel_sublevel: 180
   stock_localversion: "-perf-gb24d113"
-  # 是否顺带把 vendor 的 wifi 模块 (qca_cld3_wlan.ko / cnss2.ko) 用同一棵树编出来
+  # 是否顺带把 vendor 的 wifi 模块 (qca_cld3_wlan.ko) 用同一棵树编出来
   build_vendor_mods: "true"
 
 on:
@@ -41,7 +41,7 @@ on:
         type: boolean
         default: true
       vendor_mods:
-        description: "顺带编译 vendor wifi 模块 (qca_cld3_wlan.ko / cnss2.ko), 用于替换 /vendor/lib/modules"
+        description: "顺带编译 vendor wifi 模块 (qca_cld3_wlan.ko), 用于替换 /vendor/lib/modules"
         type: boolean
         default: true
 
@@ -207,7 +207,7 @@ jobs:
             echo "### abi_mode=none: 跳过 ABI 补丁 (退回 r6 行为)"
           fi
 
-          # ---- vendor wifi DLKM (qca_cld3_wlan / cnss2) ----
+          # ---- vendor wifi DLKM (qca_cld3_wlan, 传输层用内建 icnss) ----
           # 出厂 defconfig 里这几项全是 n: vendor 把 wifi 栈做成 /vendor/lib/modules
           # 下的独立 .ko, 而它们是用小米未公开的 4.14.180 出厂树编的, 换任何公开树
           # 都过不了 check_version() (实测 518 条符号只对上 229 条)。唯一正确解是
@@ -223,8 +223,24 @@ jobs:
               sed -i "/^${k}=/d; /^# ${k} is not set$/d" $DEFCONFIG
               printf '%s\n' "$1" >> $DEFCONFIG
             }
-            add_cfg 'CONFIG_CNSS2=m'
-            add_cfg 'CONFIG_CNSS2_QMI=y'
+            # ---- r21: 对齐原厂 icnss/SNOC 架构, 彻底不要 cnss2 ----
+            # 实测(原厂内核只读观察)确认 cepheus 的 WiFi 芯片走 SNOC + legacy icnss,
+            # 与 PCIe/cnss2 毫无关系:
+            #   /sys/bus/pci/devices/                    -> 完全为空
+            #   readlink /sys/class/net/wlan0/device     -> 18800000.qcom,icnss
+            #   原厂 lsmod                               -> 只有 icnss + wlan, 没有 cnss2
+            #   原厂 defconfig                           -> CONFIG_ICNSS=y, # CONFIG_CNSS2 is not set
+            #   icnss debugfs stats                      -> pin_connect_result: 1 (SNOC 专属)
+            # 之前编 cnss2.ko 是纯污染源: 它会去 assert EP reset / 训练一条根本不存在的
+            # PCIe 链路, 表现为 LTSSM 全程 DETECT_QUIET (22 次), 永远起不来。
+            #
+            # ICNSS 的 Kconfig 是 bool / 由 drivers/soc/qcom/Kconfig 提供, 且 pld_snoc.c
+            # 靠 #include <soc/qcom/icnss.h> 被 CONFIG_ICNSS=y 在 Kbuild 里选中 —— 与
+            # 原厂 boot.img 的符号布局一致(自编 25 个 icnss_* / 原厂 23 个, 均 0 个 cnss2_*)。
+            add_cfg 'CONFIG_ICNSS=y'
+            add_cfg 'CONFIG_ICNSS_QMI=y'
+            # 明确写死关闭, 防止 defconfig 派生或 Kconfig select 把它悄悄打开
+            add_cfg '# CONFIG_CNSS2 is not set'
             # CNSS_UTILS 的 Kconfig 是 bool (drivers/net/wireless/cnss_utils/Kconfig),
             # 写 =m 会被 kconfig 判非法然后静默丢弃 -> 编不出模块也编不进内核。
             # 它没有独立 .ko 的必要, 直接内建, 顺带把原厂 cnss_utils.ko 的 ABI
@@ -346,15 +362,19 @@ jobs:
             fi
           fi
 
-          # cepheus 原厂 DTB 的 pcie@1c00000 节点里没有 perst-gpio 属性,
-          # 而本树 pci-msm 把它标成 required=true -> probe -2 失败 ->
-          # PCIe RC0 永远不绑定 -> cnss 拿不到 RC0 -> WiFi 起不来。
-          # 实机日志:
+          # ---- r21: 撤掉 pci-msm perst 补丁 ----
+          # 原 r20 在这里跑 scripts/fix-pci-msm-perst.py, 理由是想修
           #   msm_pcie_get_resources: Could not get required GPIO perst-gpio
-          #   msm_pcie_probe: PCIe: Driver probe failed for RC0:-2
-          if [ "${{ env.build_vendor_mods }}" = "true" ] && [ -f drivers/pci/host/pci-msm.c ]; then
-            python3 "$GITHUB_WORKSPACE/this-repo/scripts/fix-pci-msm-perst.py"
-          fi
+          # 实测证明这是一条死路, 已删除调用:
+          #   - 原厂 DTB 里 pcie@1c00000 本来就没有 perst-gpio 属性(DT 设计如此),
+          #     GPIO 表第 6 字段 required 改成 optional 只影响 probe 是否返回 -ENOENT,
+          #     不改变任何硬件行为
+          #   - WiFi 根本不走这条 PCIe 控制器(见上面 icnss 说明), 补丁即使生效也只是
+          #     让一个不参与 WiFi 的控制器 probe 成功
+          #   - 实机 boot_option = 0x1 = MSM_PCIE_NO_PROBE_ENUMERATION, pci-msm.c 直接
+          #     return 0 从不枚举, 补丁完全够不着
+          # 脚本文件本身保留在 scripts/ 下备查, 不再在构建里调用。
+          echo "### r21: 跳过 fix-pci-msm-perst.py (WiFi 走 icnss/SNOC, 与 PCIe 无关)"
 
       - name: Build kernel
         working-directory: kernel
@@ -386,11 +406,18 @@ jobs:
           done
           echo "abi_mode=${{ env.abi_mode }}"
           if [ "${{ env.build_vendor_mods }}" = "true" ]; then
-            echo "=== vendor wifi stack in out/.config ==="
-            grep -E '^CONFIG_(CNSS2|CNSS_UTILS|WCNSS_MEM_PRE_ALLOC|QCA_CLD_WLAN)' out/.config || true
-            for o in CONFIG_CNSS2 CONFIG_QCA_CLD_WLAN; do
-              grep -q "^$o=m" out/.config || { echo "ERROR: $o != m, 编不出 wifi .ko"; exit 1; }
+            echo "=== vendor wifi stack in out/.config (r21: icnss/SNOC) ==="
+            grep -E '^CONFIG_(ICNSS|ICNSS_QMI|CNSS_UTILS|WCNSS_MEM_PRE_ALLOC|QCA_CLD_WLAN)|^# CONFIG_CNSS2 is not set' out/.config || true
+            # 传输层必须是 icnss, 编成模块的话 in-kernel 的 wlan 栈拿不到符号
+            for o in CONFIG_ICNSS CONFIG_ICNSS_QMI; do
+              grep -q "^$o=y" out/.config || { echo "ERROR: $o != y, icnss 传输层没内建, WiFi 起不来"; exit 1; }
             done
+            # cnss2 绝对不能出现: 它会去训练一条不存在的 PCIe 链路, 是 r20 的失败根因
+            if grep -qE '^CONFIG_CNSS2(_QMI)?=' out/.config; then
+              echo "ERROR: CONFIG_CNSS2 被重新打开了, 这会重新引入 PCIe 假链路"; exit 1
+            fi
+            grep -q '^CONFIG_QCA_CLD_WLAN=m' out/.config \
+              || { echo "ERROR: CONFIG_QCA_CLD_WLAN != m, 编不出 wlan.ko"; exit 1; }
             # 这两项只能内建 (bool / 源码在 MODULE 下编不过)
             for o in CONFIG_CNSS_UTILS CONFIG_WCNSS_MEM_PRE_ALLOC; do
               grep -q "^$o=y" out/.config || { echo "ERROR: $o != y (它只能内建)"; exit 1; }
@@ -462,10 +489,11 @@ jobs:
       # check_version() —— 实测 518 条符号只有 229 条对得上 (44%), 连
       # `void __stack_chk_fail(void)` 这种无参函数都对不上, 所以对齐 ABI 这条路
       # 已经封死. 唯一正确解是让模块和内核同源: 用我们自己的 .config 编出
-      # wlan.ko / cnss2.ko, 再把它们换到 /vendor/lib/modules 里.
+      # wlan.ko, 再把它换到 /vendor/lib/modules 里.
       #
-      # 出厂 defconfig 里 CNSS*/QCA_CLD_WLAN 全是 n (vendor 把它们做成独立 .ko),
-      # Configure 步骤已把它们打开成 m, 这里只负责编出来 + 校验。
+      # r21: 传输层用内建 icnss(CONFIG_ICNSS=y), 只编 qcacld 的 wlan.ko。
+      # 出厂 defconfig 里 QCA_CLD_WLAN 是 n (vendor 把它做成独立 .ko),
+      # Configure 步骤已经打开成 m, 这里只负责编出来 + 校验。
       # ---------------------------------------------------------------------
       - name: Build vendor DLKMs (wlan stack)
         if: ${{ env.build_vendor_mods == 'true' }}
@@ -489,15 +517,18 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             HOSTCC=gcc HOSTCFLAGS=-fcommon"
 
-          echo "=== wlan stack config 生效情况 ==="
-          grep -E '^CONFIG_(CNSS|CNSS2|QCA_CLD_WLAN)' out/.config || true
-          for o in CONFIG_CNSS2 CONFIG_QCA_CLD_WLAN; do
-            grep -q "^$o=m" out/.config || { echo "ERROR: $o 没生效, 编不出 wi-fi 模块"; exit 1; }
-          done
+          echo "=== wlan stack config 生效情况 (r21: icnss) ==="
+          grep -E '^CONFIG_(ICNSS|ICNSS_QMI|CNSS|QCA_CLD_WLAN)|^# CONFIG_CNSS2 is not set' out/.config || true
+          grep -q '^CONFIG_ICNSS=y' out/.config || { echo "ERROR: CONFIG_ICNSS 没内建, WiFi 起不来"; exit 1; }
+          grep -q '^CONFIG_QCA_CLD_WLAN=m' out/.config || { echo "ERROR: CONFIG_QCA_CLD_WLAN 没生效, 编不出 wi-fi 模块"; exit 1; }
+          if grep -qE '^CONFIG_CNSS2(_QMI)?=' out/.config; then
+            echo "ERROR: CONFIG_CNSS2 又出现了, 这会重新引入 PCIe 假链路"; exit 1
+          fi
 
-          # 必须先删掉这两个目录的 .o: make 不跟踪 KCFLAGS 变化, 不删就会直接复用
+          # 必须先删掉 qcacld 的 .o: make 不跟踪 KCFLAGS 变化, 不删就会直接复用
           # 之前用 -fcommon 编出来的目标文件, 出来的 .ko 照样带 COMMON 符号。
-          rm -rf out/drivers/staging/qcacld-3.0 out/drivers/net/wireless/cnss2
+          # r21 起不再有 cnss2 目录需要清理。
+          rm -rf out/drivers/staging/qcacld-3.0
 
           # -k: 树里其它 =m 的驱动坏掉不要连累 wifi
           set +e
@@ -507,8 +538,7 @@ jobs:
           echo "=== 生成的 .ko ==="
           find out -name '*.ko' | sort | sed 's|^out/||' | head -60
           echo "=== wlan 栈 ==="
-          ls -la out/drivers/staging/qcacld-3.0/*.ko \
-                 out/drivers/net/wireless/cnss2/*.ko 2>/dev/null || true
+          ls -la out/drivers/staging/qcacld-3.0/*.ko 2>/dev/null || true
 
           test -f out/drivers/staging/qcacld-3.0/wlan.ko \
             || { echo "ERROR: wlan.ko 没编出来"
@@ -517,8 +547,7 @@ jobs:
 
           # 硬校验: .ko 里不许有 COMMON 符号, 否则装到手机上必然 Exec format error
           echo "=== COMMON 符号检查 (必须为空) ==="
-          for f in out/drivers/staging/qcacld-3.0/wlan.ko \
-                   out/drivers/net/wireless/cnss2/cnss2.ko; do
+          for f in out/drivers/staging/qcacld-3.0/wlan.ko; do
             [ -f "$f" ] || continue
             n=$(aarch64-linux-gnu-readelf -sW "$f" 2>/dev/null | awk '$7=="COM"{c++} END{print c+0}')
             echo "$(basename $f): COM=$n"
@@ -526,12 +555,26 @@ jobs:
           done
           echo "wlan.ko OK"
 
+          # r21 关键校验: 模块必须真的链到 icnss, 而不是 cnss2 / msm_pcie。
+          # 这是判断"传输层有没有配错"的唯一硬指标 —— 原厂 wlan.ko 是 23 个 icnss_*、
+          # 0 个 cnss2_*、0 个 msm_pcie_*, 我们的自编版应与之一致 (25/0/0)。
+          echo "=== 传输层符号核对 (icnss 必须 >0, cnss2/msm_pcie 必须 =0) ==="
+          n_icnss=$(aarch64-linux-gnu-readelf -sW out/drivers/staging/qcacld-3.0/wlan.ko 2>/dev/null \
+                    | awk '$7=="UND"{print $8}' | grep -c '^icnss_' || true)
+          n_cnss2=$(aarch64-linux-gnu-readelf -sW out/drivers/staging/qcacld-3.0/wlan.ko 2>/dev/null \
+                    | awk '$7=="UND"{print $8}' | grep -c '^cnss2_' || true)
+          n_pcie=$(aarch64-linux-gnu-readelf -sW out/drivers/staging/qcacld-3.0/wlan.ko 2>/dev/null \
+                   | awk '$7=="UND"{print $8}' | grep -c '^msm_pcie_' || true)
+          echo "icnss_*=$n_icnss  cnss2_*=$n_cnss2  msm_pcie_*=$n_pcie"
+          [ "$n_icnss" -gt 0 ] || { echo "ERROR: wlan.ko 没有 icnss_* 依赖, 传输层配错了"; exit 1; }
+          [ "$n_cnss2" = "0" ] || { echo "ERROR: wlan.ko 引用了 cnss2_*, 走错 PCIe 路线"; exit 1; }
+          [ "$n_pcie" = "0" ]  || { echo "ERROR: wlan.ko 引用了 msm_pcie_*"; exit 1; }
+
           # 树里开了 CONFIG_DEBUG_INFO, wlan.ko 会到 300MB+, 根本推不进手机。
           # strip --strip-debug 只删调试段, .modinfo / __versions / .symtab 都留着,
           # 不影响加载。
           echo "=== strip 调试信息 ==="
-          for f in out/drivers/staging/qcacld-3.0/wlan.ko \
-                   out/drivers/net/wireless/cnss2/cnss2.ko; do
+          for f in out/drivers/staging/qcacld-3.0/wlan.ko; do
             [ -f "$f" ] || continue
             before=$(stat -c %s "$f")
             aarch64-linux-gnu-strip --strip-debug "$f" 2>/dev/null || true
@@ -539,7 +582,7 @@ jobs:
             echo "$(basename $f): $((before/1024/1024))MB -> $((after/1024/1024))MB"
           done
           echo "=== strip 后 ==="
-          ls -la out/drivers/staging/qcacld-3.0/wlan.ko out/drivers/net/wireless/cnss2/cnss2.ko 2>/dev/null || true
+          ls -la out/drivers/staging/qcacld-3.0/wlan.ko 2>/dev/null || true
 
       - name: Package vendor modules
         if: ${{ env.build_vendor_mods == 'true' }}
@@ -548,10 +591,9 @@ jobs:
           OUT=vendor-modules
           rm -rf $OUT && mkdir -p $OUT
           # 设备上的文件名 <- 我们的模块名。MIUI 把 qcacld 的 wlan.ko 改名成
-          # qca_cld3_wlan.ko, 其余同名。
-          # cnss_utils / cnss_prealloc 都是内建进 vmlinux 的, 这里不再有 .ko。
+          # qca_cld3_wlan.ko。cnss_utils 是内建进 vmlinux 的, 这里不再有 .ko。
+          # r21 起不再有 cnss2.ko —— WiFi 走 icnss/SNOC, cnss2 只会去训练不存在的 PCIe 链路。
           cp kernel/out/drivers/staging/qcacld-3.0/wlan.ko $OUT/qca_cld3_wlan.ko
-          cp kernel/out/drivers/net/wireless/cnss2/cnss2.ko $OUT/
           ls -la $OUT
 
           # wlan.ko 忘了 strip 会是 300MB+, 手机 /vendor 分区放不下
@@ -624,11 +666,18 @@ jobs:
 
             ### WiFi 模块 (本包含 wlan stack 时)
             本包同时提供 `vendor-modules.tar.gz`, 内含用同一棵内核树编出来的
-            `qca_cld3_wlan.ko` / `cnss2.ko` / `cnss_prealloc.ko`。
+            `qca_cld3_wlan.ko`。
 
-            出厂的 vendor DLKM 是按 4.14.180 的布局编的, 与本树 (4.14.357 代码 +
-            4.14.180 版本号) 结构体有漂移, 会被 `check_version()` 拒载 —— 这就是
-            "刷完没 WiFi" 的原因。换成同源模块即可, 不需要对齐 ABI。
+            cepheus 的 WiFi 走 **SNOC + legacy icnss**(不是 PCIe/cnss2):
+            `CONFIG_ICNSS=y` 内建传输层, `/sys/class/net/wlan0/device` 指向
+            `18800000.qcom,icnss`, 原厂 `lsmod` 只有 `icnss` + `wlan`。
+            出厂 `qca_cld3_wlan.ko` 是按 4.14.180 的布局编的, 与本树 (4.14.357 代码 +
+            4.14.180 版本号) 结构体有漂移, 会被 `check_version()` 拒载 ——
+            这就是"刷完没 WiFi"的原因。换成同源模块即可, 不需要对齐 ABI。
+
+            注意: 光 `insmod` 不够, wlan 驱动还在 `/dev/wlan` 这个 misc 设备的
+            write 回调里等一个 `"ON"` 才会调 `hdd_driver_load()`。正常由 MIUI
+            框架写; 手动加载要补 `printf 'ON\n' > /dev/wlan`。
 
             **首次开机 wifi 大概率仍不可用**, 这是预期: 内核已是新的, 模块还是出厂的。
             开机后:
