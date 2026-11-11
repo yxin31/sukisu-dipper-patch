@@ -1,0 +1,689 @@
+name: Build BakaSU (ReSukiSU) for cepheus (MIUI kernel tree)
+
+# 为什么不用 MiCode/Xiaomi_Kernel_OpenSource?
+#   那份 cepheus-q-oss 是 4.14.117 的 Android-10 基线快照, 不是 MIUI 12.5 出货用的树:
+#     - 缺 block 层的 ICE backport (`struct bvec_iter.bi_dun`), 一开
+#       CONFIG_FS_ENCRYPTION_INLINE_CRYPT 就编译失败
+#     - 缺 MIUI 专有驱动 (MIHW / MIGT / MILLET / MI_MEMORY_SYSFS /
+#       XIAOMI_SOLUTION / QTI_CRYPTO_TZ / QCOM_SOC_INFO ...)
+#   用它编出来的内核刷进 MIUI 只会卡 Mi logo, 改 config 救不回来。
+#
+# 这里用 Xirudly/kernel_xiaomi_cepheus 的 16 分支 + BakaSU (ReSukiSU) v4.2:
+#   - 基于小米 MIUI 内核树 (自带 cepheus_stock_defconfig + MIUI 驱动)
+#   - 树里已经带好 KSU hook 调用点 (fs/exec.c / fs/open.c / fs/stat.c / kernel/reboot.c)
+#   - BakaSU 用 manual hook 模式: 官方声明 kernel 3.4+ 可用, 4.14 不需要 susfs
+#   - 不带 susfs: susfs 内核侧要打 simonpunk 的 4.14 补丁, 官方只保证 5.10+
+#     隐藏 root 依赖 kernel_umount + selinux_hide + ZygiskNext/TrickyStore/HMA
+
+env:
+  kernel_repository: Xirudly/kernel_xiaomi_cepheus
+  kernel_ref: 16
+  bakasu_repository: Baka-SU/BakaSU
+  bakasu_ref: v4.2.0-rc3
+  device: cepheus
+  # 树里自带的出厂配置 (从 MIUI 出货内核提取, 含 MIUI 专有驱动)
+  defconfig: cepheus_stock_defconfig
+  stock_kernel_sublevel: 180
+  stock_localversion: "-perf-gb24d113"
+  # 是否顺带把 vendor 的 wifi 模块 (qca_cld3_wlan.ko) 用同一棵树编出来
+  build_vendor_mods: "true"
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "Kernel branch (default: 16)"
+        required: false
+        default: "16"
+      abi_mode:
+        description: "ABI 模式: strict=只对齐 struct module 布局(vendor 模块仍被 CRC 挡掉) / permissive=再关 MODVERSIONS 放行 vendor 模块 / none=完全不打补丁"
+        type: choice
+        options: [strict, permissive, none]
+        default: strict
+      allow_rebuild:
+        description: "Force rebuild"
+        type: boolean
+        default: true
+      vendor_mods:
+        description: "顺带编译 vendor wifi 模块 (qca_cld3_wlan.ko), 用于替换 /vendor/lib/modules"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: Build MIUI kernel
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Set env
+        run: |
+          echo "kernel_ref=${{ inputs.kernel_ref || env.kernel_ref }}" | tee -a $GITHUB_ENV
+          echo "abi_mode=${{ inputs.abi_mode || 'strict' }}" | tee -a $GITHUB_ENV
+          # inputs.vendor_mods 是 boolean, 未传时为空串 -> 回落到 workflow 级默认 true
+          if [ "${{ inputs.vendor_mods }}" = "false" ]; then
+            echo "build_vendor_mods=false" | tee -a $GITHUB_ENV
+          else
+            echo "build_vendor_mods=true" | tee -a $GITHUB_ENV
+          fi
+
+      - name: Install packages
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            bc bison flex \
+            libssl-dev libelf-dev \
+            python3 cpio zip
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.kernel_repository }}
+          ref: ${{ env.kernel_ref }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Checkout this repo (prebuilt header/dtb + packer)
+        uses: actions/checkout@v4
+        with:
+          path: this-repo
+
+      - name: Inspect source tree
+        working-directory: kernel
+        run: |
+          echo "kernel_commit_id=$(git rev-parse --short HEAD)" | tee -a $GITHUB_ENV
+          echo "=== version ==="
+          head -5 Makefile | grep -E "VERSION|PATCHLEVEL|SUBLEVEL"
+          echo "=== 树里是否残留 kernelsu 目录 (应当没有) ==="
+          ls -d drivers/kernelsu 2>/dev/null && echo "WARN: drivers/kernelsu 已存在, 将被覆盖" || echo "clean"
+          echo "=== 预置的 ksu hook 调用点 ==="
+          grep -rn 'ksu_handle' fs/exec.c fs/open.c fs/stat.c kernel/reboot.c 2>/dev/null | head -10
+          echo "=== BakaSU 源码 ==="
+          ls -l ../bakasu/kernel/Kconfig ../bakasu/kernel/Kbuild
+          echo "=== defconfig present ==="
+          ls -l arch/arm64/configs/${{ env.defconfig }}
+
+      - name: Checkout BakaSU
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.bakasu_repository }}
+          ref: ${{ env.bakasu_ref }}
+          path: bakasu
+          # BakaSU 的 Kbuild 用 git describe / rev-list 算版本号, 并靠 .git/shallow
+          # 判断要不要 unshallow; 浅克隆会算出一个很小的版本号, 管理器会拒。
+          fetch-depth: 0
+
+      - name: Integrate BakaSU into kernel tree
+        working-directory: kernel
+        run: |
+          set -e
+          bash ../this-repo/cepheus/scripts/integrate_bakasu.sh "$PWD" "$PWD/../bakasu"
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          DEFCONFIG=arch/arm64/configs/${{ env.defconfig }}
+          set -e
+
+          # ---- 必须早于 make defconfig 的 Kconfig 改动 ----
+          # 非 PIE 链接下 kallsyms 的 relative 模式会报
+          # "relative symbol value ... out of range in relative mode",
+          # CONFIG_KALLSYMS_BASE_RELATIVE 无 prompt, 只能改 Kconfig default。
+          if [ -f init/Kconfig ]; then
+            sed -i '/^config KALLSYMS_BASE_RELATIVE$/,/^config /{s/^\tdefault .*/\tdefault n/}' init/Kconfig
+            echo "=== KALLSYMS_BASE_RELATIVE ==="
+            grep -A4 '^config KALLSYMS_BASE_RELATIVE$' init/Kconfig
+          fi
+
+          # ---- defconfig 覆盖: Root = BakaSU manual hook ----
+          # 这棵树的 conf 是"defconfig 透传", 子开关不会按 default 自动生成,
+          # 必须显式写出, 否则 Kconfig 里对应的 #ifdef 全被编译掉。
+          FRAG=../this-repo/cepheus/scripts/bakasu.fragment
+          test -f "$FRAG" || { echo "ERROR: 缺 $FRAG"; exit 1; }
+          if grep -q '^CONFIG_KSU=y' $DEFCONFIG; then
+            echo "defconfig 已带 CONFIG_KSU, 先清掉旧的 KSU 开关"
+            sed -i '/^CONFIG_KSU/d; /^# CONFIG_KSU/d' $DEFCONFIG
+          fi
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            k=$(printf '%s' "$line" | sed 's/^#* *//; s/[= ].*//')
+            [ -z "$k" ] && continue
+            sed -i "/^${k}=/d; /^# ${k} is not set$/d" $DEFCONFIG
+            printf '%s\n' "$line" >> $DEFCONFIG
+          done < "$FRAG"
+          echo "=== BakaSU config 已写入 ==="
+          grep -E '^CONFIG_KSU|^# CONFIG_KSU' $DEFCONFIG
+
+          # 4.14 arm64 没有 HAVE_ARCH_PREL32_RELOCATIONS,
+          # ___ksymtab 存 64 位绝对地址 -> PIE 下新版 binutils 报
+          # "dangerous relocation: unsupported relocation"。
+          # 因此放弃 KASLR (RELOCATABLE/RANDOMIZE_BASE 一起关),
+          # 内核按 Image header 的 text_offset 固定加载。
+          # 代价仅是没有地址随机化, 与 root/SUSFS 隐藏无关。
+          for opt in CONFIG_RELOCATABLE CONFIG_RANDOMIZE_BASE; do
+            sed -i "s/^$opt=y/# $opt is not set/" $DEFCONFIG
+            grep -q "^# $opt is not set" $DEFCONFIG || echo "# $opt is not set" >> $DEFCONFIG
+          done
+
+          # GCC 11 的 __builtin_object_size 太激进, 老驱动 copy_from_user 会
+          # 编译期误报 __bad_copy_to (msm ipa)。
+          sed -i 's/^CONFIG_FORTIFY_SOURCE=y/# CONFIG_FORTIFY_SOURCE is not set/' $DEFCONFIG
+          grep -q 'CONFIG_FORTIFY_SOURCE' $DEFCONFIG || echo '# CONFIG_FORTIFY_SOURCE is not set' >> $DEFCONFIG
+
+          # ---- vendor DLKM ABI 对齐 (WiFi / 音频不工作的真正原因) ----
+          # 实机 dmesg: 14 个 /vendor/lib/modules/*.ko 全部只报同一句
+          #   "disagrees about version of symbol module_layout"
+          # 没有任何其它符号报错 => ABI 差异只集中在 struct module 上。
+          # 从设备拖回 qca_cld3_wlan.ko / audio_wcd_core.ko 解析出的出厂真值:
+          #   vermagic              = 4.14.180-perf-gb24d113 SMP preempt mod_unload modversions aarch64
+          #   module_layout CRC     = 0x4ad0cd64
+          #   sizeof(struct module)= 0x380 (896)
+          # 具体差在: using_gplonly_symbols / BPF_EVENTS 两字段 / FUNCTION_ERROR_INJECTION,
+          # 以及 RELOCATABLE=n 把 ARM64_MODULE_PLTS 连带关掉, 少 40 字节的
+          # struct mod_arch_specific。全部处理逻辑见 scripts/abi-align-414180.sh。
+          #
+          # 注意: "关 MODVERSIONS 强行放行"(r7) 单独用是不行的, 成员偏移还是错的。
+          # 现在的做法是先把布局真对齐(本脚本 1~4 步 + 6 步探针), 再按 abi_mode
+          # 决定要不要放行 vendor 模块。
+          if [ "$abi_mode" != "none" ]; then
+            bash ../this-repo/scripts/abi-align-414180.sh "$DEFCONFIG" "$abi_mode"
+          else
+            echo "### abi_mode=none: 跳过 ABI 补丁 (退回 r6 行为)"
+          fi
+
+          # ---- vendor wifi DLKM (qca_cld3_wlan, 传输层用内建 icnss) ----
+          # 出厂 defconfig 里这几项全是 n: vendor 把 wifi 栈做成 /vendor/lib/modules
+          # 下的独立 .ko, 而它们是用小米未公开的 4.14.180 出厂树编的, 换任何公开树
+          # 都过不了 check_version() (实测 518 条符号只对上 229 条)。唯一正确解是
+          # 用我们自己的 .config 编出同源的模块再替换进去。
+          #
+          # 写进 defconfig 而不是事后改 out/.config, 是为了让 Image 和 modules 在同一次
+          # 编译里完成 —— 事后改 .config 会让 autoconf.h 变脏, 整个树重编一遍。
+          # 这些都是 =m, 不进 Image, 对内核本体和 ABI 零影响。
+          if [ "$build_vendor_mods" = "true" ]; then
+            add_cfg() {
+              local k
+              k=$(printf '%s' "$1" | sed 's/^#* *//; s/[= ].*//')
+              sed -i "/^${k}=/d; /^# ${k} is not set$/d" $DEFCONFIG
+              printf '%s\n' "$1" >> $DEFCONFIG
+            }
+            # ---- r21: 对齐原厂 icnss/SNOC 架构, 彻底不要 cnss2 ----
+            # 实测(原厂内核只读观察)确认 cepheus 的 WiFi 芯片走 SNOC + legacy icnss,
+            # 与 PCIe/cnss2 毫无关系:
+            #   /sys/bus/pci/devices/                    -> 完全为空
+            #   readlink /sys/class/net/wlan0/device     -> 18800000.qcom,icnss
+            #   原厂 lsmod                               -> 只有 icnss + wlan, 没有 cnss2
+            #   原厂 defconfig                           -> CONFIG_ICNSS=y, # CONFIG_CNSS2 is not set
+            #   icnss debugfs stats                      -> pin_connect_result: 1 (SNOC 专属)
+            # 之前编 cnss2.ko 是纯污染源: 它会去 assert EP reset / 训练一条根本不存在的
+            # PCIe 链路, 表现为 LTSSM 全程 DETECT_QUIET (22 次), 永远起不来。
+            #
+            # ICNSS 的 Kconfig 是 bool / 由 drivers/soc/qcom/Kconfig 提供, 且 pld_snoc.c
+            # 靠 #include <soc/qcom/icnss.h> 被 CONFIG_ICNSS=y 在 Kbuild 里选中 —— 与
+            # 原厂 boot.img 的符号布局一致(自编 25 个 icnss_* / 原厂 23 个, 均 0 个 cnss2_*)。
+            add_cfg 'CONFIG_ICNSS=y'
+            add_cfg 'CONFIG_ICNSS_QMI=y'
+            # 明确写死关闭, 防止 defconfig 派生或 Kconfig select 把它悄悄打开
+            add_cfg '# CONFIG_CNSS2 is not set'
+            # CNSS_UTILS 的 Kconfig 是 bool (drivers/net/wireless/cnss_utils/Kconfig),
+            # 写 =m 会被 kconfig 判非法然后静默丢弃 -> 编不出模块也编不进内核。
+            # 它没有独立 .ko 的必要, 直接内建, 顺带把原厂 cnss_utils.ko 的 ABI
+            # 风险一并消掉 (原厂那个会被 check_version 拒之门外, 用的就是这个)。
+            add_cfg 'CONFIG_CNSS_UTILS=y'
+            # 符号名是 WCNSS_MEM_PRE_ALLOC, 不是 CNSS_PREALLOC (那个根本不存在)。
+            # 它必须 =y 内建, 不能编成模块: 这棵树的 cnss_prealloc.c:387 写了
+            #   MODULE_DESCRIPTION(DEVICE "WCNSS Prealloc Driver");
+            # 而 DEVICE 宏全树都没有定义。内建时 MODULE_DESCRIPTION 展开成空,
+            # 所以出厂 defconfig 的 =y 一直没事; 一旦 -DMODULE, 它就变成
+            # MODULE_INFO(description, DEVICE "..." ) -> "expected ',' or ';' before 'DEVICE'"。
+            add_cfg 'CONFIG_WCNSS_MEM_PRE_ALLOC=y'
+            add_cfg 'CONFIG_QCA_CLD_WLAN=m'
+            # DVB_MPQ_DEMUX 是出厂 defconfig 里遗留的 =m, 它引用的
+            # ion_alloc_dmabuf 在 ION 没开任何 heap 时不存在, modpost 会直接
+            # 整体失败 -> 一个 .ko 都不生成。cepheus 上没有 DVB 硬件, 关掉。
+            add_cfg '# CONFIG_DVB_MPQ is not set'
+            echo "=== vendor DLKM config 已写入 defconfig ==="
+            grep -E '^CONFIG_(CNSS|QCA_CLD_WLAN)|^# CONFIG_DVB_MPQ is not set' $DEFCONFIG || true
+          else
+            echo "### build_vendor_mods=false: 不编 wifi 模块"
+          fi
+
+          # 不用 clang 的 LTO
+          sed -i 's/^CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' $DEFCONFIG
+
+          # 这三个是这棵树新加的符号 (kernel/cpu.c 用), 出厂 defconfig 里没有。
+          # 不给值的话 conf 会当成 NEW 符号弹交互, CI 下直接 abort。
+          # 数值取自同仓库的 cepheus_defconfig (0x0f / 0x70 / 0x80)。
+          for kv in LITTLE_CPU_MASK=15 BIG_CPU_MASK=112 PRIME_CPU_MASK=128; do
+            k=${kv%%=*}
+            grep -q "^CONFIG_$k=" $DEFCONFIG || echo "CONFIG_$kv" >> $DEFCONFIG
+          done
+
+          # ---- 版本号伪装成原厂 (vermagic 必须完全一致) ----
+          sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${{ env.stock_kernel_sublevel }}/" Makefile
+          if grep -q '^CONFIG_LOCALVERSION=' $DEFCONFIG; then
+            sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"${{ env.stock_localversion }}\"|" $DEFCONFIG
+          else
+            echo "CONFIG_LOCALVERSION=\"${{ env.stock_localversion }}\"" >> $DEFCONFIG
+          fi
+          sed -i 's/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' $DEFCONFIG
+
+          echo "=== version alignment ==="
+          head -5 Makefile | grep -E "VERSION|PATCHLEVEL|SUBLEVEL"
+          grep '^CONFIG_LOCALVERSION' $DEFCONFIG
+          echo "=== root/hide config ==="
+          grep -E '^CONFIG_KSU' $DEFCONFIG || true
+
+      - name: Patch Makefiles for GCC 11 on 4.14
+        working-directory: kernel
+        run: |
+          # -Werror 在老代码 + 新编译器下几乎必然踩坑
+          for f in Makefile scripts/Makefile.build; do
+            [ -f "$f" ] || continue
+            sed -i 's/-Werror=/-Wno-error=/g' "$f"
+            sed -i 's/-Werror\([^a-zA-Z=-]\)/-Wno-error\1/g' "$f"
+            sed -i 's/-Werror$/-Wno-error/g' "$f"
+          done
+
+          # 小米内核自带的 gcc-wrapper.py 是 Python2 语法, Python3 下直接崩溃
+          if [ -f scripts/gcc-wrapper.py ]; then
+            printf '%s\n' '#!/usr/bin/env python3' 'import subprocess, sys' \
+              'sys.exit(subprocess.call(sys.argv[1:]))' > scripts/gcc-wrapper.py
+            chmod +x scripts/gcc-wrapper.py
+            echo "=== gcc-wrapper.py replaced ==="
+          fi
+
+          # 关闭编译期 object-size 检查 (运行时 __check_object_size 仍保留)
+          if [ -f include/linux/compiler-gcc.h ]; then
+            sed -i 's/__compiletime_object_size(obj) __builtin_object_size(obj, 0)/__compiletime_object_size(obj) (-1)/' \
+              include/linux/compiler-gcc.h
+            grep -n 'compiletime_object_size' include/linux/compiler-gcc.h || true
+          fi
+
+          # 去掉 setlocalversion 在 dirty tree 下追加的 "+",
+          # 否则 vermagic 变成 4.14.180-perf-gb24d113+, vendor .ko 全部加载失败
+          if [ -f scripts/setlocalversion ]; then
+            sed -i 's|res="\$res${scm:++}"|res="$res"|' scripts/setlocalversion
+            grep -n 'res="\$res"' scripts/setlocalversion || true
+          fi
+
+          # 子模块 pin 的 BakaSU 比树里的 SUSFS v2.3.0 新:
+          # 它会在 setuid hook 里外部调用 susfs_run_sus_path_loop(),
+          # 但 fs/susfs.c 里这个函数是 static -> vmlinux 链接期 undefined reference。
+          # 新版 SUSFS 里它本来就是全局的, 去掉 static 即可对齐。
+          if [ -f fs/susfs.c ]; then
+            sed -i 's/^static void susfs_run_sus_path_loop(void)/void susfs_run_sus_path_loop(void)/' fs/susfs.c
+            echo "=== susfs_run_sus_path_loop linkage ==="
+            grep -n 'susfs_run_sus_path_loop' fs/susfs.c | head -3
+            if ! grep -q '^void susfs_run_sus_path_loop(void)' fs/susfs.c; then
+              echo "ERROR: failed to un-static susfs_run_sus_path_loop"
+              exit 1
+            fi
+            # 补上声明, 避免隐式声明
+            grep -q 'void susfs_run_sus_path_loop(void);' include/linux/susfs.h || \
+              sed -i '/susfs_add_sus_path_loop/a void susfs_run_sus_path_loop(void);' include/linux/susfs.h
+            grep -n 'susfs_run_sus_path_loop' include/linux/susfs.h || true
+          fi
+
+          # 小米自定义 .bss.rtic 段在 GCC 11 下会让 ADRP 溢出
+          if [ -f include/linux/init.h ] && grep -q '__rticdata' include/linux/init.h; then
+            sed -i 's|^#define __rticdata.*|#define __rticdata|' include/linux/init.h
+            grep -n '__rticdata' include/linux/init.h || true
+          fi
+
+          # vdso 的 .S / .lds 预处理路径拿不到 __has_attribute (走的是
+          # -traditional-cpp 一类的简化预处理), 直接用 #if __has_attribute(...)
+          # 会报 "missing binary operator before token ("。
+          # 这棵树里只有 compiler_types.h:331 一处, 且 GCC 11 一定支持
+          # __fallthrough__ 属性, 所以直接常量化为真。
+          if [ -f include/linux/compiler_types.h ]; then
+            sed -i 's/^#if __has_attribute(__fallthrough__)$/#if 1/' include/linux/compiler_types.h
+            echo "=== fallthrough guard ==="
+            grep -n -B1 -A3 'define fallthrough' include/linux/compiler_types.h || true
+            if grep -q '^#if __has_attribute(__fallthrough__)$' include/linux/compiler_types.h; then
+              echo "ERROR: failed to neutralise __has_attribute(__fallthrough__) guard"
+              exit 1
+            fi
+          fi
+
+          # ---- r21: 撤掉 pci-msm perst 补丁 ----
+          # 原 r20 在这里跑 scripts/fix-pci-msm-perst.py, 理由是想修
+          #   msm_pcie_get_resources: Could not get required GPIO perst-gpio
+          # 实测证明这是一条死路, 已删除调用:
+          #   - 原厂 DTB 里 pcie@1c00000 本来就没有 perst-gpio 属性(DT 设计如此),
+          #     GPIO 表第 6 字段 required 改成 optional 只影响 probe 是否返回 -ENOENT,
+          #     不改变任何硬件行为
+          #   - WiFi 根本不走这条 PCIe 控制器(见上面 icnss 说明), 补丁即使生效也只是
+          #     让一个不参与 WiFi 的控制器 probe 成功
+          #   - 实机 boot_option = 0x1 = MSM_PCIE_NO_PROBE_ENUMERATION, pci-msm.c 直接
+          #     return 0 从不枚举, 补丁完全够不着
+          # 脚本文件本身保留在 scripts/ 下备查, 不再在构建里调用。
+          echo "### r21: 跳过 fix-pci-msm-perst.py (WiFi 走 icnss/SNOC, 与 PCIe 无关)"
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          set -x
+          MK="make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            HOSTCC=gcc HOSTCFLAGS=-fcommon \
+            KCFLAGS=-fcommon"
+
+          $MK ${{ env.defconfig }}
+          # 兜底: 对任何仍未赋值的 NEW 符号取默认值, 避免 silentoldconfig 交互中止
+          $MK olddefconfig
+
+          echo "=== boot-critical config ==="
+          grep -E '^CONFIG_(KSU|KSU_SUSFS|RELOCATABLE|RANDOMIZE_BASE|UTS_NS|PSI|STATIC_USERMODEHELPER_PATH|SECURITY_SELINUX|FS_ENCRYPTION_INLINE_CRYPT|SCSI_UFS_QCOM_ICE)=' out/.config || true
+          echo "=== BakaSU config in out/.config ==="
+          grep -E '^CONFIG_KSU|^# CONFIG_KSU' out/.config || true
+          for o in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK; do
+            grep -q "^$o=y" out/.config || { echo "ERROR: $o 没有生效, manual hook 不完整"; exit 1; }
+          done
+          grep -q '^# CONFIG_KSU_SUSFS is not set' out/.config || { echo "ERROR: KSU_SUSFS 应当关闭"; exit 1; }
+          for o in CONFIG_THREAD_INFO_IN_TASK CONFIG_UTS_NS CONFIG_PSI; do
+            grep -q "^$o=y" out/.config || { echo "ERROR: $o != y, 出厂配置是 y"; exit 1; }
+          done
+          # ABI 关键项: 任何一条不满足, /vendor/lib/modules 下的原厂 .ko 全废
+          for o in CONFIG_ARM64_MODULE_PLTS CONFIG_MODULE_UNLOAD CONFIG_PREEMPT CONFIG_SMP CONFIG_MODULES; do
+            grep -q "^$o=y" out/.config || { echo "ERROR: $o != y, struct module 布局会与出厂不一致"; exit 1; }
+          done
+          echo "abi_mode=${{ env.abi_mode }}"
+          if [ "${{ env.build_vendor_mods }}" = "true" ]; then
+            echo "=== vendor wifi stack in out/.config (r21: icnss/SNOC) ==="
+            grep -E '^CONFIG_(ICNSS|ICNSS_QMI|CNSS_UTILS|WCNSS_MEM_PRE_ALLOC|QCA_CLD_WLAN)|^# CONFIG_CNSS2 is not set' out/.config || true
+            # 传输层必须是 icnss, 编成模块的话 in-kernel 的 wlan 栈拿不到符号
+            for o in CONFIG_ICNSS CONFIG_ICNSS_QMI; do
+              grep -q "^$o=y" out/.config || { echo "ERROR: $o != y, icnss 传输层没内建, WiFi 起不来"; exit 1; }
+            done
+            # cnss2 绝对不能出现: 它会去训练一条不存在的 PCIe 链路, 是 r20 的失败根因
+            if grep -qE '^CONFIG_CNSS2(_QMI)?=' out/.config; then
+              echo "ERROR: CONFIG_CNSS2 被重新打开了, 这会重新引入 PCIe 假链路"; exit 1
+            fi
+            grep -q '^CONFIG_QCA_CLD_WLAN=m' out/.config \
+              || { echo "ERROR: CONFIG_QCA_CLD_WLAN != m, 编不出 wlan.ko"; exit 1; }
+            # 这两项只能内建 (bool / 源码在 MODULE 下编不过)
+            for o in CONFIG_CNSS_UTILS CONFIG_WCNSS_MEM_PRE_ALLOC; do
+              grep -q "^$o=y" out/.config || { echo "ERROR: $o != y (它只能内建)"; exit 1; }
+            done
+          fi
+          if [ "${{ env.abi_mode }}" = "permissive" ]; then
+            grep -q '^# CONFIG_MODVERSIONS is not set' out/.config \
+              || { echo "ERROR: permissive 模式下 MODVERSIONS 必须关闭"; exit 1; }
+            grep -q 'forced-vendor-dlkm' include/linux/vermagic.h \
+              || { echo "ERROR: vermagic.h 的 modversions 标记没强制打开, vendor .ko 会拒载"; exit 1; }
+          elif [ "${{ env.abi_mode }}" = "strict" ]; then
+            grep -q '^CONFIG_MODVERSIONS=y' out/.config \
+              || { echo "ERROR: strict 模式下 MODVERSIONS 必须保持 y"; exit 1; }
+          fi
+          if [ "${{ env.abi_mode }}" != "none" ]; then
+            grep -q '__ksu_abi_sizeof_module' kernel/module.c \
+              || { echo "ERROR: struct module 探针没埋上"; exit 1; }
+            [ "$(grep -c 'ABI: 4.14.180 的 struct module 没有这两个成员' include/linux/module.h)" = "2" ] \
+              || { echo "ERROR: module.h 的 ABI 补丁不完整 (应有 2 处 #if 0)"; exit 1; }
+            grep -q 'ABI: struct module 无 bpf_raw_events' kernel/module.c \
+              || { echo "ERROR: module.c 的 bpf_raw_events 补丁没生效"; exit 1; }
+            grep -q 'ABI: struct module 无 ei_funcs' kernel/module.c \
+              || { echo "ERROR: module.c 的 ei_funcs 补丁没生效"; exit 1; }
+          fi
+          # BPF_EVENTS (bool + default y) 和 FUNCTION_ERROR_INJECTION (def_bool y)
+          # 都是"无 prompt"的符号, defconfig 里写 not set 会被 olddefconfig 重算掉,
+          # 已改为在源码里摘字段 (scripts/abi-align-414180.sh 第 2~4 步)。
+          # CFI_CLANG 在 arch/arm64/Kconfig 里受 CC_IS_CLANG 保护, 用 gcc 编译时该符号
+          # 根本不会出现在 .config 里 (既不是 =y 也不是 "# ... is not set")。
+          # 所以只断言 "不能是 =y", 而不是要求存在注释行。
+          if grep -q '^CONFIG_CFI_CLANG=y' out/.config; then
+            echo "ERROR: CFI_CLANG=y, struct module 会多一个 cfi_check 成员"; exit 1
+          fi
+          echo "CFI_CLANG: not enabled (ok)"
+          grep -q '^CONFIG_ARM64_MODULE_CMODEL_LARGE=y' out/.config || { echo "ERROR: CMODEL_LARGE 没跟着 PLTS 打开"; exit 1; }
+          if grep -q '^CONFIG_RELOCATABLE=y' out/.config; then echo "ERROR: RELOCATABLE=y 但代码非 PIE"; exit 1; fi
+
+          set +e
+          $MK -j$(nproc --all) Image 2>&1 | tee build.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ $RC -ne 0 ] || [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "ERROR: build failed (rc=$RC)"
+            grep -nE "error:|Error [0-9]" build.log | tail -40 || true
+            exit 1
+          fi
+          ls -la out/arch/arm64/boot/Image
+          CAT=$(cat out/include/config/kernel.release)
+          echo "kernel.release = $CAT"
+          if [ "$CAT" != "4.14.${stock_kernel_sublevel}${stock_localversion}" ]; then
+            echo "ERROR: kernel release '$CAT' != expected, vermagic 会不匹配"
+            exit 1
+          fi
+          echo "vermagic compatible: $CAT"
+
+          # ABI 自检: 链接阶段就定了的事, 不要靠刷机去试
+          if [ "${{ env.abi_mode }}" != "none" ]; then
+            echo "=== ABI self-check (struct module probes vs 出厂 .ko) ==="
+            python3 ../this-repo/scripts/abi-verify.py out/vmlinux
+          else
+            echo "=== ABI self-check skipped (abi_mode=none) ==="
+          fi
+
+      # ---------------------------------------------------------------------
+      # 用同一棵树编 vendor DLKM (WiFi 那一套)
+      #
+      # 为什么要自己编: 设备 /vendor/lib/modules 下的 qca_cld3_wlan.ko 是从小米
+      # 未公开的 4.14.180 出厂树编出来的, 换任何一棵公开树都过不了
+      # check_version() —— 实测 518 条符号只有 229 条对得上 (44%), 连
+      # `void __stack_chk_fail(void)` 这种无参函数都对不上, 所以对齐 ABI 这条路
+      # 已经封死. 唯一正确解是让模块和内核同源: 用我们自己的 .config 编出
+      # wlan.ko, 再把它换到 /vendor/lib/modules 里.
+      #
+      # r21: 传输层用内建 icnss(CONFIG_ICNSS=y), 只编 qcacld 的 wlan.ko。
+      # 出厂 defconfig 里 QCA_CLD_WLAN 是 n (vendor 把它做成独立 .ko),
+      # Configure 步骤已经打开成 m, 这里只负责编出来 + 校验。
+      # ---------------------------------------------------------------------
+      - name: Build vendor DLKMs (wlan stack)
+        if: ${{ env.build_vendor_mods == 'true' }}
+        working-directory: kernel
+        run: |
+          set -x
+          # 注意这里没有 KCFLAGS=-fcommon !!
+          #
+          # 内核主体 (Image) 必须 -fcommon: GCC 10 起默认 -fno-common, 4.14 老代码里
+          # 同一 header 有多处 `int foo;` 定义, 不开 -fcommon 会 multiple definition。
+          #
+          # 但模块反过来必须 -fno-common: kernel/module.c 的 simplify_symbols() 遇到
+          # SHN_COMMON 符号会
+          #     pr_err("%s: please compile with -fno-common\n", mod->name);
+          #     return -ENOEXEC;
+          # 于是 insmod 报 "Exec format error"。实机验证过, 就是这么栽的:
+          #     wlan: please compile with -fno-common   (刷屏 24 次)
+          #     insmod: failed to load ...: Exec format error
+          MK="make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            HOSTCC=gcc HOSTCFLAGS=-fcommon"
+
+          echo "=== wlan stack config 生效情况 (r21: icnss) ==="
+          grep -E '^CONFIG_(ICNSS|ICNSS_QMI|CNSS|QCA_CLD_WLAN)|^# CONFIG_CNSS2 is not set' out/.config || true
+          grep -q '^CONFIG_ICNSS=y' out/.config || { echo "ERROR: CONFIG_ICNSS 没内建, WiFi 起不来"; exit 1; }
+          grep -q '^CONFIG_QCA_CLD_WLAN=m' out/.config || { echo "ERROR: CONFIG_QCA_CLD_WLAN 没生效, 编不出 wi-fi 模块"; exit 1; }
+          if grep -qE '^CONFIG_CNSS2(_QMI)?=' out/.config; then
+            echo "ERROR: CONFIG_CNSS2 又出现了, 这会重新引入 PCIe 假链路"; exit 1
+          fi
+
+          # 必须先删掉 qcacld 的 .o: make 不跟踪 KCFLAGS 变化, 不删就会直接复用
+          # 之前用 -fcommon 编出来的目标文件, 出来的 .ko 照样带 COMMON 符号。
+          # r21 起不再有 cnss2 目录需要清理。
+          rm -rf out/drivers/staging/qcacld-3.0
+
+          # -k: 树里其它 =m 的驱动坏掉不要连累 wifi
+          set +e
+          $MK KCFLAGS=-fno-common -j$(nproc --all) -k modules 2>&1 | tee modules.log
+          set -e
+
+          echo "=== 生成的 .ko ==="
+          find out -name '*.ko' | sort | sed 's|^out/||' | head -60
+          echo "=== wlan 栈 ==="
+          ls -la out/drivers/staging/qcacld-3.0/*.ko 2>/dev/null || true
+
+          test -f out/drivers/staging/qcacld-3.0/wlan.ko \
+            || { echo "ERROR: wlan.ko 没编出来"
+                 grep -nE 'error:|Error [0-9]|ERROR:' modules.log | tail -40
+                 exit 1; }
+
+          # 硬校验: .ko 里不许有 COMMON 符号, 否则装到手机上必然 Exec format error
+          echo "=== COMMON 符号检查 (必须为空) ==="
+          for f in out/drivers/staging/qcacld-3.0/wlan.ko; do
+            [ -f "$f" ] || continue
+            n=$(aarch64-linux-gnu-readelf -sW "$f" 2>/dev/null | awk '$7=="COM"{c++} END{print c+0}')
+            echo "$(basename $f): COM=$n"
+            [ "$n" = "0" ] || { echo "ERROR: $(basename $f) 还有 $n 个 COMMON 符号"; exit 1; }
+          done
+          echo "wlan.ko OK"
+
+          # r21 关键校验: 模块必须真的链到 icnss, 而不是 cnss2 / msm_pcie。
+          # 这是判断"传输层有没有配错"的唯一硬指标 —— 原厂 wlan.ko 是 23 个 icnss_*、
+          # 0 个 cnss2_*、0 个 msm_pcie_*, 我们的自编版应与之一致 (25/0/0)。
+          echo "=== 传输层符号核对 (icnss 必须 >0, cnss2/msm_pcie 必须 =0) ==="
+          n_icnss=$(aarch64-linux-gnu-readelf -sW out/drivers/staging/qcacld-3.0/wlan.ko 2>/dev/null \
+                    | awk '$7=="UND"{print $8}' | grep -c '^icnss_' || true)
+          n_cnss2=$(aarch64-linux-gnu-readelf -sW out/drivers/staging/qcacld-3.0/wlan.ko 2>/dev/null \
+                    | awk '$7=="UND"{print $8}' | grep -c '^cnss2_' || true)
+          n_pcie=$(aarch64-linux-gnu-readelf -sW out/drivers/staging/qcacld-3.0/wlan.ko 2>/dev/null \
+                   | awk '$7=="UND"{print $8}' | grep -c '^msm_pcie_' || true)
+          echo "icnss_*=$n_icnss  cnss2_*=$n_cnss2  msm_pcie_*=$n_pcie"
+          [ "$n_icnss" -gt 0 ] || { echo "ERROR: wlan.ko 没有 icnss_* 依赖, 传输层配错了"; exit 1; }
+          [ "$n_cnss2" = "0" ] || { echo "ERROR: wlan.ko 引用了 cnss2_*, 走错 PCIe 路线"; exit 1; }
+          [ "$n_pcie" = "0" ]  || { echo "ERROR: wlan.ko 引用了 msm_pcie_*"; exit 1; }
+
+          # 树里开了 CONFIG_DEBUG_INFO, wlan.ko 会到 300MB+, 根本推不进手机。
+          # strip --strip-debug 只删调试段, .modinfo / __versions / .symtab 都留着,
+          # 不影响加载。
+          echo "=== strip 调试信息 ==="
+          for f in out/drivers/staging/qcacld-3.0/wlan.ko; do
+            [ -f "$f" ] || continue
+            before=$(stat -c %s "$f")
+            aarch64-linux-gnu-strip --strip-debug "$f" 2>/dev/null || true
+            after=$(stat -c %s "$f")
+            echo "$(basename $f): $((before/1024/1024))MB -> $((after/1024/1024))MB"
+          done
+          echo "=== strip 后 ==="
+          ls -la out/drivers/staging/qcacld-3.0/wlan.ko 2>/dev/null || true
+
+      - name: Package vendor modules
+        if: ${{ env.build_vendor_mods == 'true' }}
+        run: |
+          set -e
+          OUT=vendor-modules
+          rm -rf $OUT && mkdir -p $OUT
+          # 设备上的文件名 <- 我们的模块名。MIUI 把 qcacld 的 wlan.ko 改名成
+          # qca_cld3_wlan.ko。cnss_utils 是内建进 vmlinux 的, 这里不再有 .ko。
+          # r21 起不再有 cnss2.ko —— WiFi 走 icnss/SNOC, cnss2 只会去训练不存在的 PCIe 链路。
+          cp kernel/out/drivers/staging/qcacld-3.0/wlan.ko $OUT/qca_cld3_wlan.ko
+          ls -la $OUT
+
+          # wlan.ko 忘了 strip 会是 300MB+, 手机 /vendor 分区放不下
+          sz=$(stat -c %s $OUT/qca_cld3_wlan.ko)
+          if [ "$sz" -gt 63000000 ]; then
+            echo "ERROR: qca_cld3_wlan.ko 还有 $((sz/1024/1024))MB, 看样子没 strip 成功"
+            exit 1
+          fi
+
+          echo "=== vermagic 核对 (必须与设备内核实测一致) ==="
+          for f in $OUT/*.ko; do
+            echo "--- $f"
+            aarch64-linux-gnu-strings -a "$f" | grep -m1 '^vermagic=' || echo "(no vermagic)"
+          done
+
+          cp this-repo/tools/install-vendor-modules.sh $OUT/install.sh
+          {
+            echo "# 由 $(git -C this-repo rev-parse --short HEAD) 于 $(date -u) 生成"
+            echo "# kernel.release: $(cat kernel/out/include/config/kernel.release)"
+            echo "# 目标: /vendor/lib/modules"
+            echo "# kernel_commit: $(git -C kernel rev-parse --short HEAD)"
+            ls -la $OUT
+          } > $OUT/MANIFEST
+          tar -czf vendor-modules.tar.gz -C $OUT .
+          ls -la vendor-modules.tar.gz
+
+      - name: Pack boot.img
+        run: |
+          python3 this-repo/cepheus/scripts/build_bootimg.py \
+            --header this-repo/cepheus/prebuilt/cepheus-boot-header.bin \
+            --image kernel/out/arch/arm64/boot/Image \
+            --dtb this-repo/cepheus/prebuilt/cepheus-stock-dtb.bin \
+            --out boot.img
+          ls -la boot.img
+          md5sum boot.img | tee boot.img.md5
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bakasu-cepheus-boot
+          path: |
+            boot.img
+            boot.img.md5
+            kernel/out/.config
+            vendor-modules.tar.gz
+            kernel/modules.log
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: bakasu-cepheus-${{ env.kernel_commit_id }}-r${{ github.run_number }}
+          body: |
+            ## BakaSU (ReSukiSU) for Xiaomi Mi 9 (cepheus) — MIUI kernel tree
+
+            **Base tree:** `${{ env.kernel_repository }}@${{ env.kernel_ref }}` (${{ env.kernel_commit_id }})
+            **Why this tree:** 小米 OSS 的 `cepheus-q-oss` 是 4.14.117 的 A10 基线, 缺 ICE block backport 与全部 MIUI 专有驱动, 编出来刷 MIUI 必卡 logo。这棵树是 MIUI 内核树。
+            **Config:** `${{ env.defconfig }}` (出厂配置) + `CONFIG_KSU` (manual hook)
+            **Reported version:** 4.14.${{ env.stock_kernel_sublevel }}${{ env.stock_localversion }} (vermagic 与原厂一致)
+            **ABI mode:** `${{ env.abi_mode }}` — strict: 只对齐 struct module 布局, vendor DLKM 仍被 CRC 挡掉; permissive: 额外关掉 MODVERSIONS 放行 vendor DLKM; none: 无补丁
+            **Root:** BakaSU v4.2.0-rc3 (manual hook) · **Hide:** kernel_umount + selinux_hide + Zygisk
+
+            ### Flash
+            ```
+            fastboot getvar product     # 必须是 cepheus
+            fastboot flash boot boot.img
+            fastboot reboot
+            ```
+
+            ### WiFi 模块 (本包含 wlan stack 时)
+            本包同时提供 `vendor-modules.tar.gz`, 内含用同一棵内核树编出来的
+            `qca_cld3_wlan.ko`。
+
+            cepheus 的 WiFi 走 **SNOC + legacy icnss**(不是 PCIe/cnss2):
+            `CONFIG_ICNSS=y` 内建传输层, `/sys/class/net/wlan0/device` 指向
+            `18800000.qcom,icnss`, 原厂 `lsmod` 只有 `icnss` + `wlan`。
+            出厂 `qca_cld3_wlan.ko` 是按 4.14.180 的布局编的, 与本树 (4.14.357 代码 +
+            4.14.180 版本号) 结构体有漂移, 会被 `check_version()` 拒载 ——
+            这就是"刷完没 WiFi"的原因。换成同源模块即可, 不需要对齐 ABI。
+
+            注意: 光 `insmod` 不够, wlan 驱动还在 `/dev/wlan` 这个 misc 设备的
+            write 回调里等一个 `"ON"` 才会调 `hdd_driver_load()`。正常由 MIUI
+            框架写; 手动加载要补 `printf 'ON\n' > /dev/wlan`。
+
+            **首次开机 wifi 大概率仍不可用**, 这是预期: 内核已是新的, 模块还是出厂的。
+            开机后:
+            ```
+            adb push vendor-modules.tar.gz /data/local/tmp/
+            adb shell su -c 'mkdir -p /data/local/tmp/vm && \
+              tar -xzf /data/local/tmp/vendor-modules.tar.gz -C /data/local/tmp/vm && \
+              sh /data/local/tmp/vm/install.sh'
+            adb reboot
+            ```
+            回滚: `install.sh` 会把原厂 .ko 备份到 `/data/local/tmp/vendor-modules-backup`。
+
+            ### Restore
+            ```
+            fastboot flash boot <stock boot.img>
+            ```
+          files: |
+            boot.img
+            boot.img.md5
