@@ -102,9 +102,7 @@ jobs:
           echo "=== 树里是否残留 kernelsu 目录 (应当没有) ==="
           ls -d drivers/kernelsu 2>/dev/null && echo "WARN: drivers/kernelsu 已存在, 将被覆盖" || echo "clean"
           echo "=== 预置的 ksu hook 调用点 ==="
-          grep -rn 'ksu_handle' fs/exec.c fs/open.c fs/stat.c kernel/reboot.c 2>/dev/null | head -10
-          echo "=== BakaSU 源码 ==="
-          ls -l ../bakasu/kernel/Kconfig ../bakasu/kernel/Kbuild
+          grep -rn 'ksu_handle' fs/exec.c fs/open.c fs/stat.c kernel/reboot.c 2>/dev/null | head -10 || true
           echo "=== defconfig present ==="
           ls -l arch/arm64/configs/${{ env.defconfig }}
 
