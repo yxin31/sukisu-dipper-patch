@@ -380,8 +380,11 @@ jobs:
         run: |
           # /proc/version 里的 "(gcc version 11.4.0 (Ubuntu 11.4.0-1ubuntu1~22.04.3),
           # GNU ld (GNU Binutils for Ubuntu) 2.38)" 会直接暴露是 Ubuntu 22.04 CI 编的。
-          # patch mkcompile_h: 凡是「从 $CC -v / --version 取版本串」的赋值都换成原厂风格。
-          # 找不到就跳过, 绝不让构建挂掉。
+          #
+          # r3 的教训: 4.14 的 mkcompile_h 不是 `VAR=$(... $CC -v ...)` 赋值形式, 而是
+          #   echo \#define LINUX_COMPILER \"`$CC -v 2>&1 | tail -n 1`\"
+          # 内联反引号形式, 所以只匹配 `^VAR=` 的正则什么都没改到。
+          # 这里同时处理三种写法: 反引号、$( )、以及 VAR= 赋值。
           python3 - <<'PYEOF'
           import re, pathlib, sys
           p = pathlib.Path('scripts/mkcompile_h')
@@ -389,16 +392,30 @@ jobs:
               print('WARN: scripts/mkcompile_h 不存在, 跳过')
               sys.exit(0)
           s = p.read_text()
-          pat = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=.*\$CC\s+(?:-v|--version).*$', re.M)
-          new, n = pat.subn(r'\1="gcc version 4.9.x 20150123 (prerelease) (GCC) "', s)
-          if n == 0:
-              print('WARN: 没匹配到 $CC -v 赋值, 编译器串保持原样')
+          FIXED = 'gcc version 4.9.x 20150123 (prerelease) (GCC) '
+
+          n_total = 0
+          # 1) 反引号内联: `$CC -v 2>&1 | tail -n 1`
+          s, n = re.subn(r'`[^`\n]*\$CC\s+(?:-v|--version)[^`\n]*`', FIXED, s)
+          n_total += n
+          # 2) 命令替换: $($CC -v 2>&1 | tail -n 1)
+          s, n = re.subn(r'\$\([^()\n]*\$CC\s+(?:-v|--version)[^()\n]*\)', FIXED, s)
+          n_total += n
+          # 3) 变量赋值: CC_VERSION=$(... $CC -v ...)
+          s, n = re.subn(r'^([A-Za-z_][A-Za-z0-9_]*)=.*\$CC\s+(?:-v|--version).*$',
+                         r'\1="' + FIXED + '"', s, flags=re.M)
+          n_total += n
+
+          if n_total == 0:
+              print('WARN: 三种写法都没匹配到, 编译器串保持原样')
           else:
-              p.write_text(new)
-              print(f'OK: 已替换 {n} 处编译器版本串')
+              p.write_text(s)
+              print(f'OK: 已替换 {n_total} 处编译器版本串')
           PYEOF
-          echo "--- 现在 mkcompile_h 里的版本相关行 ---"
-          grep -n -E 'CC_VERSION|COMPILER|BUILD_USER|BUILD_HOST|BUILD_TIMESTAMP' scripts/mkcompile_h || true
+          echo "--- mkcompile_h 里仍然出现的 \$CC -v 调用 (应为空) ---"
+          grep -n '\$CC[[:space:]]*\(-v\|--version\)' scripts/mkcompile_h || echo "(none)"
+          echo "--- LINUX_COMPILER 生成行 ---"
+          grep -n 'LINUX_COMPILER' scripts/mkcompile_h || true
 
       - name: Build kernel
         working-directory: kernel
