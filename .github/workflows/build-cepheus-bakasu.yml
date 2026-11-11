@@ -28,6 +28,18 @@ env:
   # 是否顺带把 vendor 的 wifi 模块 (qca_cld3_wlan.ko) 用同一棵树编出来
   build_vendor_mods: "true"
 
+  # ---- 抹掉构建机器指纹 (/proc/version) ----
+  # 不改的话编译出来是:
+  #   Linux version 4.14.180-perf-gb24d113 (runner@runnervmlby3q)
+  #   (gcc version 11.4.0 (Ubuntu 11.4.0-1ubuntu1~22.04.3)...) #1 SMP PREEMPT Wed Nov 11 02:50:45 UTC 2026
+  # /proc/version 是 -r--r--r-- 全局可读, 银行/游戏风控能直接读到 GitHub Actions 的
+  # runner 主机名和"未来"的编译时间。这里把它对齐到本机 MIUI 出货时间
+  # (ro.build.date = Thu Nov 25 11:45:50 CST 2021), 名字用原厂风格。
+  # 注意: 这三项只影响 utsname / linux_banner, 不影响 vermagic。
+  KBUILD_BUILD_USER: builder
+  KBUILD_BUILD_HOST: cepheus-build
+  KBUILD_BUILD_TIMESTAMP: "Thu Nov 25 11:45:50 CST 2021"
+
 on:
   workflow_dispatch:
     inputs:
@@ -362,6 +374,31 @@ jobs:
           #     return 0 从不枚举, 补丁完全够不着
           # 脚本文件本身保留在 scripts/ 下备查, 不再在构建里调用。
           echo "### r21: 跳过 fix-pci-msm-perst.py (WiFi 走 icnss/SNOC, 与 PCIe 无关)"
+
+      - name: Mask compiler fingerprint in mkcompile_h
+        working-directory: kernel
+        run: |
+          # /proc/version 里的 "(gcc version 11.4.0 (Ubuntu 11.4.0-1ubuntu1~22.04.3),
+          # GNU ld (GNU Binutils for Ubuntu) 2.38)" 会直接暴露是 Ubuntu 22.04 CI 编的。
+          # patch mkcompile_h: 凡是「从 $CC -v / --version 取版本串」的赋值都换成原厂风格。
+          # 找不到就跳过, 绝不让构建挂掉。
+          python3 - <<'PYEOF'
+          import re, pathlib, sys
+          p = pathlib.Path('scripts/mkcompile_h')
+          if not p.exists():
+              print('WARN: scripts/mkcompile_h 不存在, 跳过')
+              sys.exit(0)
+          s = p.read_text()
+          pat = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=.*\$CC\s+(?:-v|--version).*$', re.M)
+          new, n = pat.subn(r'\1="gcc version 4.9.x 20150123 (prerelease) (GCC) "', s)
+          if n == 0:
+              print('WARN: 没匹配到 $CC -v 赋值, 编译器串保持原样')
+          else:
+              p.write_text(new)
+              print(f'OK: 已替换 {n} 处编译器版本串')
+          PYEOF
+          echo "--- 现在 mkcompile_h 里的版本相关行 ---"
+          grep -n -E 'CC_VERSION|COMPILER|BUILD_USER|BUILD_HOST|BUILD_TIMESTAMP' scripts/mkcompile_h || true
 
       - name: Build kernel
         working-directory: kernel
